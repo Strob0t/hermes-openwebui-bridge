@@ -105,7 +105,58 @@ HTTP wird über eine injizierbare Client-Fabrik gemockt (Standard `aiohttp`, Ope
 
 ## 9. Offen für Teil 3b
 
-- Live prüfen: akzeptiert Hermes ein unbekanntes `session_id` (Abschnitt 3)?
-- Live prüfen: `Idempotency-Key` als Header oder Body-Feld.
 - Live prüfen: `__event_call__` Typ `confirmation` in Open WebUI v0.12.4.
-- Entscheidung Steffen: `HERMES_BASE_URL` direkt auf `hermes:8642` (eigenes Netz nötig) oder über `hermes-models`.
+- Live prüfen: Durchreichen von `/v1/runs/*` durch `owui-relay` und `hermes-models` (Abschnitt 10.1).
+- Freigaben live: nur mit einem Hermes-Profil, dessen `approvals.mode` nicht `off` ist (Abschnitt 10.3).
+
+## 10. Nachtrag 2026-11-09 (Entscheidungen Steffen, Code-Fakten)
+
+Die Punkte unten ergänzen oder ersetzen die Abschnitte 2, 3 und 5.
+
+### 10.1 Pfad zu Hermes (ersetzt die offene Frage in Abschnitt 9)
+
+- Entscheidung: direkter Pfad ohne eigenen Code im Router. Belegt (`homeserver/ki/build/hermes-models/app.py`): der Router leitet jeden Pfad außer `/v1/chat/completions` und `/v1/responses` über `proxy()` durch (`other`, Z.747-750). Bei `text/event-stream` puffert `Relay` nur bis zum Frame-Ende (`FRAME_END`), schreibt nur Frames mit `event: hermes.tool.progress|hermes.status` um und gibt alle anderen Frames unverändert zurück (`Relay.frame`, Z.270-271). Request-Header außer Hop-by-Hop gehen durch (`HOP`, Z.57), also auch `Idempotency-Key` und `Last-Event-ID`. `owui-relay` ist TCP-HAProxy mit 15 min Timeout.
+- Default `HERMES_BASE_URL = http://hermes-gw.hermes:8642/v1` (Alias liegt in `NO_PROXY` von Open WebUI). Kein Netzumbau. Hermes bleibt allein im Netz `internal`.
+- `Idempotency-Key` ist ein Request-Header (belegt R Z.781-785: 1-255 sichtbare ASCII-Zeichen). Wert: `owui:<chat_id>:<message_id>`.
+
+### 10.2 Session (ersetzt Abschnitt 3)
+
+- Kein eigenes `session_id` und keine Mapping-Datei. Die Pipe sendet den Header `X-Hermes-Session-Key: owui:<user_id>:<chat_id>`, wie der bestehende Chat-Pfad (Referenz `owui-hermes-api.md`). Hermes löst den Key selbst zur Session auf (`_declared_conversation_session`, A Z.1603; R Z.843-847: `selected_session_id = session_id or declared(gateway_session_key)`) und lädt die Historie aus `state.db`. Body ohne `session_id`, `input` = nur die letzte Nutzernachricht.
+- `/reset`: die Pipe hängt an den Key ein Suffix `:r<n>` (in-memory Zähler pro `chat_id`). Hermes beginnt eine neue Session. Valves `SESSION_TTL_HOURS` und `SESSION_FILE` entfallen.
+- Antwort-Header `X-Hermes-Session-Id` nur loggen (`debug`).
+
+### 10.3 Freigaben (ersetzt Abschnitt 5, Teil "nur once oder deny")
+
+Belegt (A Z.84-101): Hermes sendet im Event `approval.request` das Feld `choices`, Teilmenge von `once, session, always, deny`; `always` fehlt bei `allow_permanent=false`, `session` und `always` fehlen bei `smart_denied`. `POST /approval` nimmt alle vier (R Z.1377), Aliase `approve|approved|allow` = `once` (R Z.1353).
+
+Valves (Admin-Valves, keine UserValves):
+
+| Valve | Default | Zweck |
+|---|---|---|
+| `APPROVAL_MODE` | `ask` | `ask` Dialog; `auto` ohne Dialog mit `AUTO_CHOICE`; `deny` immer `deny` |
+| `ALLOWED_APPROVAL_CHOICES` | `once,deny,session` | Angebot = Schnittmenge aus Event-`choices` und dieser Liste, in dieser Reihenfolge |
+| `AUTO_CHOICE` | `session` | Wahl bei `APPROVAL_MODE=auto`; fällt auf `once` zurück, wenn nicht in Event-`choices` |
+| `APPROVAL_TIMEOUT` | `300` | danach `deny` |
+
+Dialog: Schnittmenge hat nur `once,deny` → `__event_call__` Typ `confirmation` (wahr = `once`). Schnittmenge hat mehr → `__event_call__` Typ `input` mit Text "Antwort: once, session, always oder deny" (Default-Wert `once`); ungültige Eingabe = `deny`. Ohne `__event_call__`: Fallback per Chatbefehl `/approve [once|session|always]` oder `/deny` (Abschnitt 5 bleibt). `always` ist nur erreichbar, wenn der Admin es in `ALLOWED_APPROVAL_CHOICES` einträgt; README dokumentiert das Risiko (dauerhafte Freigabe, Widerruf nur in Hermes).
+
+Stack `ki` heute: `config.yaml` hat `approvals.mode: "off"` (belegt). Hermes sendet dort keine `approval.request`. Der Freigabe-Pfad ist für Profile mit `smart` oder `manual` und wird nur per Mock getestet.
+
+### 10.4 Manifold und Rollen
+
+- Die Pipe ist ein Manifold (`type = "manifold"`, Methode `pipes()`), Modelle aus Valve `MODELS` (JSON, Default `[{"id":"hermes-runs","name":"Hermes Runs"}]`). Jeder Eintrag darf `approval_mode`, `allowed_approval_choices`, `auto_choice` und `allowed_roles` überschreiben. Beispiel in README: `hermes-runs` (`auto`) für die Owner-Gruppe, `hermes-runs-guarded` (`ask`, `once,deny`) als Vorlage. Sichtbarkeit pro Gruppe regelt Open WebUI (Modellrechte).
+- Valve `ALLOWED_ROLES` Default `admin`. Rolle aus `__user__["role"]`. Andere Rolle: eine Zeile "Dieses Modell ist für dein Konto nicht freigegeben", kein Hermes-Aufruf. Grund: der Familien-Hinweis des Routers (`family_note`) wirkt nur auf Chat-Pfade, nicht auf `/v1/runs`.
+- Die Pipe sendet `X-Hermes-User-Role` und `X-Hermes-User-Name` aus `__user__` mit (Format wie der Router erwartet; heute ohne Wirkung auf `/v1/runs`, für spätere Router-Logik).
+
+### 10.5 Tests (ergänzt Abschnitt 8)
+
+Entfallen: 1-3 (Mapping, TTL, Datei). Neu:
+
+15. `test_session_key_header`: Request trägt `X-Hermes-Session-Key: owui:<user>:<chat>`, Body ohne `session_id`.
+16. `test_reset_suffix`: nach `/reset` endet der Key auf `:r1`, danach `:r2`.
+17. `test_idempotency_header`: `Idempotency-Key` = `owui:<chat>:<message_id>`, nur sichtbare ASCII.
+18. `test_choices_intersection`: Event `["once","session","always","deny"]` mit Valve `once,deny,session` ergibt `["once","deny","session"]`; Event `["once","deny"]` ergibt `["once","deny"]`.
+19. `test_input_dialog_multi_choice`: Schnittmenge > 2 ruft `__event_call__` Typ `input`; Antwort `session` sendet `{"choice":"session"}`; Antwort `foo` sendet `deny`.
+20. `test_auto_mode_choice_fallback`: `auto` mit `AUTO_CHOICE=session`, Event ohne `session` sendet `once`.
+21. `test_role_denied`: `__user__["role"]="user"` mit Default `ALLOWED_ROLES` ergibt die Hinweiszeile, kein HTTP-Aufruf.
+22. `test_manifold_pipes`: `pipes()` liefert die Einträge aus `MODELS`; Override `approval_mode` pro Modell greift.

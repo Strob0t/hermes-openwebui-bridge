@@ -29,6 +29,13 @@ Ein Filter reicht nicht: Filter sehen nur den Request (`inlet`) und die fertige 
 - Fortschritt (`tool.started`, `tool.completed`) muss die Pipe selbst als `reasoning_content` oder Status-Event ausgeben. Der Router macht das für sie nicht.
 - Filter: Open-WebUI-Filter gelten auch für Pipe-Modelle, wenn sie dem Modell oder global zugeordnet sind (Open-WebUI-Doku Filter Function; für v0.12.4 ungeprüft). `hermes_embeds` bleibt damit nutzbar.
 
+## Nachtrag 2026-11-09
+
+- Pfad: Die Pipe geht über `owui-relay` und `hermes-models` (`hermes-gw.hermes:8642`). Belegt: der Router reicht `/v1/runs/*` frame-weise durch und ändert nur `hermes.tool.progress`-Frames (`app.py`, `other`/`proxy`/`Relay.frame`). Alternative 1 oben bleibt abgelehnt, weil kein Code im Router nötig ist. Kein Netzumbau; Hermes bleibt nur im Netz `internal`.
+- Session: `X-Hermes-Session-Key` statt eigenem Mapping (Spec 10.2). Konsequenz "Mapping geht bei Neustart verloren" entfällt.
+- Freigaben: Angebot = Schnittmenge aus Hermes-`choices` und Admin-Valve `ALLOWED_APPROVAL_CHOICES` (Default `once,deny,session`); `APPROVAL_MODE=auto` für die Owner-Gruppe, Manifold mit Modellen pro Gruppe (Spec 10.3, 10.4). Entscheidung Steffen: viel Freiheit für den Owner, konservative Defaults für andere Nutzer des Repos.
+- Rollen: Valve `ALLOWED_ROLES` (Default `admin`), weil `family_note` des Routers auf `/v1/runs` nicht wirkt.
+
 ## Risiken
 
 - Freigabe-Timeout: Hermes hält den Run in `waiting_for_approval`. Die Pipe sendet nach `approval_timeout` `deny`.
