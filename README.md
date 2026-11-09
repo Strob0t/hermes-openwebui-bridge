@@ -13,7 +13,7 @@ Ausführliche Analysen und Entscheidungen befinden sich im Ordner [`docs/`](docs
 | Komponente | Typ | Status | Beschreibung |
 |---|---|---|---|
 | `skills/openwebui-visuals` | Hermes Skill | **in Arbeit** | Formatanweisungen für Hermes (Mermaid, SVG, HTML-Artifacts, `MEDIA:`-Fallback) |
-| `functions/hermes_embeds_filter.py` | Open WebUI Filter | **geplant (Teil 2)** | Wandelt ```viz-html Blöcke in native Open-WebUI `embeds` (Iframe mit Chart.js / Dashboards) |
+| `functions/hermes_embeds_filter.py` | Open WebUI Filter | **fertig (ungetestet live)** | Wandelt ```viz-html Blöcke in native Open-WebUI `embeds` (Iframe mit Chart.js / Dashboards) |
 | `functions/hermes_runs_pipe.py` | Open WebUI Pipe | **geplant (Teil 3)** | Anbindung von `/v1/runs`, Freigaben und Session-Mapping |
 | `router/` / Router-Integration | AIOHTTP Relay | **beobachtet** | Pufferung von SSE-Frames, Reasoning-Konvertierung, geplantes MEDIA-Inlining |
 
@@ -26,6 +26,6 @@ Ausführliche Analysen und Entscheidungen befinden sich im Ordner [`docs/`](docs
 
 Dieses Projekt steht unter der **GNU AGPL v3.0** (siehe [LICENSE](LICENSE)).
 
-## Drittanbieter & Patrone
+## Drittanbieter & Muster
 
 Siehe [`THIRD_PARTY.md`](THIRD_PARTY.md) für genutzte Muster und Inspirationsquellen (MIT-Lizenzen).
