@@ -144,7 +144,7 @@ Stack `ki` heute: `config.yaml` hat `approvals.mode: "off"` (belegt). Hermes sen
 
 ### 10.4 Manifold und Rollen
 
-- Die Pipe ist ein Manifold (`type = "manifold"`, Methode `pipes()`), Modelle aus Valve `MODELS` (JSON, Default `[{"id":"hermes-runs","name":"Hermes Runs"}]`). Jeder Eintrag darf `approval_mode`, `allowed_approval_choices`, `auto_choice` und `allowed_roles` überschreiben. Beispiel in README: `hermes-runs` (`auto`) für die Owner-Gruppe, `hermes-runs-guarded` (`ask`, `once,deny`) als Vorlage. Sichtbarkeit pro Gruppe regelt Open WebUI (Modellrechte).
+- Die Pipe ist ein Manifold (`type = "manifold"`, async Methode `pipes()`). Modelle per Discovery aus `GET <HERMES_BASE_URL>/models` (OpenAI-Format; `name` als Anzeigename, sonst `id`; `provider` wird übernommen). Valves: `MODEL_DISCOVERY` (Default an), `MODEL_FILTER` (Regex auf die ID), `OWNED_BY_FILTER` (Liste), `MODELS_CACHE_TTL` (Default 300 s). Fehler beim Laden: letzte Liste bleibt, sonst der einzige eingebaute Eintrag `hermes-default` (`Hermes (Gateway-Default)`), der kein `model` sendet. Die gewählte ID geht als `model` in den Run-Body. Freigabe-Regeln pro Modell über `MODEL_POLICIES` (JSON-Liste, `match` = Regex auf die ID, erster Treffer gilt; Overrides `approval_mode`, `allowed_approval_choices`, `auto_choice`, `allowed_roles`). Sichtbarkeit pro Gruppe regelt Open WebUI (Modellrechte). Der Antwort-Header aus `ROUTE_HEADER` (Default `X-Hermes-Route`) von `POST /runs` erscheint als Statuszeile.
 - Valve `ALLOWED_ROLES` Default `admin`. Rolle aus `__user__["role"]`. Andere Rolle: eine Zeile "Dieses Modell ist für dein Konto nicht freigegeben", kein Hermes-Aufruf. Grund: der Familien-Hinweis des Routers (`family_note`) wirkt nur auf Chat-Pfade, nicht auf `/v1/runs`.
 - Die Pipe sendet `X-Hermes-User-Role` und `X-Hermes-User-Name` aus `__user__` mit (Format wie der Router erwartet; heute ohne Wirkung auf `/v1/runs`, für spätere Router-Logik).
 
@@ -159,4 +159,11 @@ Entfallen: 1-3 (Mapping, TTL, Datei). Neu:
 19. `test_input_dialog_multi_choice`: Schnittmenge > 2 ruft `__event_call__` Typ `input`; Antwort `session` sendet `{"choice":"session"}`; Antwort `foo` sendet `deny`.
 20. `test_auto_mode_choice_fallback`: `auto` mit `AUTO_CHOICE=session`, Event ohne `session` sendet `once`.
 21. `test_role_denied`: `__user__["role"]="user"` mit Default `ALLOWED_ROLES` ergibt die Hinweiszeile, kein HTTP-Aufruf.
-22. `test_manifold_pipes`: `pipes()` liefert die Einträge aus `MODELS`; Override `approval_mode` pro Modell greift.
+22. `test_manifold_policies_per_model`: `pipes()` liefert die Discovery-Einträge; `MODEL_POLICIES` greift pro Modell (erster Regex-Treffer).
+23. `test_pipes_from_discovery_with_filters`: `GET /models` wird gelesen; `MODEL_FILTER` und `OWNED_BY_FILTER` filtern.
+24. `test_cache_ttl`: innerhalb `MODELS_CACHE_TTL` kein zweiter Abruf, danach einer.
+25. `test_fetch_error_keeps_last_list_or_default`: Netzfehler oder HTTP-Fehler hält die letzte Liste; ohne Liste der Eintrag `hermes-default`.
+26. `test_discovery_off`: `MODEL_DISCOVERY=False` ergibt nur `hermes-default`, kein HTTP-Aufruf.
+27. `test_run_body_model_and_provider`: gewählte ID als `model` im Body, `provider` falls vorhanden, kein `model` bei `hermes-default`; unbekannte ID geht unverändert durch.
+28. `test_policy_first_match`: erste passende Policy gewinnt; ungültiges JSON ergibt keine Policies und eine Warnung.
+29. `test_route_header_status`: Header aus `ROUTE_HEADER` erscheint als Statuszeile `Route: ...` vor `Hermes arbeitet`; leeres Valve schaltet es ab.

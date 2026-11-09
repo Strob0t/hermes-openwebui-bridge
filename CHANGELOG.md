@@ -5,6 +5,7 @@ Alle nennenswerten Änderungen an diesem Projekt werden in dieser Datei dokument
 ## [Unreleased]
 
 ### Added
+- Runs-Pipe 0.2.0: Modell-Discovery aus `GET /models` (`MODEL_DISCOVERY`, `MODEL_FILTER`, `OWNED_BY_FILTER`, `MODELS_CACHE_TTL`), Freigabe-Regeln per Regex (`MODEL_POLICIES`), gewählte ID als `model` im Run-Body, Statuszeile aus `ROUTE_HEADER`. Ersetzt das statische Valve `MODELS`.
 - Runs-Pipe 0.1.0 (Manifold, Freigaben, Session-Header) mit Tests (`functions/hermes_runs_pipe.py`, `tests/test_hermes_runs_pipe.py`).
 - ADR 0002 und Spezifikation der Runs-Pipe (`/v1/runs`, Freigaben, Session-Mapping).
 - Projektgerüst, Dokumentation und Research-Dokumente (`docs/research/`, `docs/decisions/0001-filter-not-pipe.md`).

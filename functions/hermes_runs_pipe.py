@@ -1,9 +1,9 @@
 """
 title: Hermes Runs Pipe
 author: Strob0t
-version: 0.1.0
+version: 0.2.0
 license: AGPL-3.0
-description: Runs Open WebUI chats as Hermes runs over /v1/runs, with tool progress, approval dialogs and one Hermes session per chat.
+description: Runs Open WebUI chats as Hermes runs over /v1/runs, with model discovery, tool progress, approval dialogs and one Hermes session per chat.
 required_open_webui_version: 0.12.0
 """
 
@@ -12,6 +12,7 @@ import json
 import logging
 import re
 import string
+import time
 from contextlib import aclosing
 from typing import Any, AsyncIterator, Awaitable, Callable, Optional
 from urllib.parse import quote
@@ -38,7 +39,8 @@ except ImportError:
 
 log = logging.getLogger(__name__)
 
-DEFAULT_MODELS = [{"id": "hermes-runs", "name": "Hermes Runs"}]
+DEFAULT_MODEL = {"id": "hermes-default", "name": "Hermes (Gateway-Default)", "default": True}
+POLICY_KEYS = ("approval_mode", "allowed_approval_choices", "auto_choice", "allowed_roles")
 APPROVAL_CHOICES = ("once", "session", "always", "deny")
 APPROVAL_MODES = ("ask", "auto", "deny")
 CHOICE_ALIASES = {"approve": "once", "approved": "once", "allow": "once"}
@@ -64,24 +66,68 @@ def _csv(value: Any) -> list[str]:
     return out
 
 
-def parse_models(raw: Any) -> list[dict]:
-    """Parses the MODELS valve (JSON list of objects with id, name and optional overrides).
-    Returns the default entry and logs a warning if the value has no usable entry.
+def parse_policies(raw: Any) -> list[dict]:
+    """Parses the MODEL_POLICIES valve: JSON list of {"match": <regex>, <policy keys>...}.
+    Returns [] and logs a warning if the value is not valid JSON or not a list.
+    Entries without a usable "match" regex are dropped.
     """
     try:
-        data = json.loads(raw) if isinstance(raw, str) else raw
+        data = json.loads(raw) if isinstance(raw, str) and raw.strip() else (raw or [])
     except ValueError as e:
-        log.warning("hermes runs pipe: MODELS is not valid JSON, using default: %s", e)
-        return [dict(m) for m in DEFAULT_MODELS]
+        log.warning("hermes runs pipe: MODEL_POLICIES is not valid JSON, using none: %s", e)
+        return []
+    if not isinstance(data, list):
+        log.warning("hermes runs pipe: MODEL_POLICIES is not a JSON list, using none")
+        return []
+    policies = []
+    for entry in data:
+        if not isinstance(entry, dict) or not isinstance(entry.get("match"), str):
+            continue
+        try:
+            pattern = re.compile(entry["match"])
+        except re.error as e:
+            log.warning("hermes runs pipe: MODEL_POLICIES regex %r invalid: %s", entry["match"], e)
+            continue
+        policies.append({"match": pattern, **{k: entry[k] for k in POLICY_KEYS if entry.get(k)}})
+    return policies
+
+
+def policy_for(model_id: str, policies: list[dict]) -> dict:
+    """Returns the policy keys of the first policy whose regex matches the model id (re.search), else {}."""
+    for policy in policies:
+        if policy["match"].search(model_id):
+            return {k: v for k, v in policy.items() if k != "match"}
+    return {}
+
+
+def parse_model_list(data: Any, id_filter: str = "", owned_by_csv: str = "") -> list[dict]:
+    """Builds the manifold entries from an OpenAI-style /models response.
+    Keeps id, name (else id), owned_by and provider. Applies the id regex (re.search) and the owned_by list.
+    """
+    items = data.get("data") if isinstance(data, dict) else data
+    if not isinstance(items, list):
+        return []
+    pattern = None
+    if id_filter and id_filter.strip():
+        try:
+            pattern = re.compile(id_filter.strip())
+        except re.error as e:
+            log.warning("hermes runs pipe: MODEL_FILTER regex invalid, ignoring it: %s", e)
+    owners = _csv(owned_by_csv)
     models = []
-    if isinstance(data, list):
-        for entry in data:
-            if isinstance(entry, dict) and isinstance(entry.get("id"), str) and entry["id"].strip():
-                model_id = entry["id"].strip()
-                models.append({**entry, "id": model_id, "name": str(entry.get("name") or model_id)})
-    if not models:
-        log.warning("hermes runs pipe: MODELS has no usable entry, using default")
-        return [dict(m) for m in DEFAULT_MODELS]
+    for item in items:
+        if not isinstance(item, dict) or not isinstance(item.get("id"), str) or not item["id"].strip():
+            continue
+        model_id = item["id"].strip()
+        owned_by = str(item.get("owned_by") or "")
+        if pattern is not None and not pattern.search(model_id):
+            continue
+        if owners and owned_by.lower() not in owners:
+            continue
+        entry = {"id": model_id, "name": str(item.get("name") or model_id), "owned_by": owned_by}
+        if isinstance(item.get("provider"), str) and item["provider"].strip():
+            entry["provider"] = item["provider"].strip()
+        models.append(entry)
     return models
 
 
@@ -266,15 +312,28 @@ class _Ctx:
         self.role = str(user.get("role") or "")
         self.name = str(user.get("name") or "")
         self.key = (self.user_id, self.chat_id)
-        entry = pipe.model_entry(self.model)
-        mode = str(entry.get("approval_mode") or v.APPROVAL_MODE or "").strip().lower()
+        self.short_model = pipe.short_model_id(self.model)
+        entry = pipe.model_entry(self.short_model)
+        self.run_model = "" if not entry or entry.get("default") else str(entry.get("id") or "")
+        self.run_provider = str(entry.get("provider") or "") if entry else ""
+        policy = policy_for(self.short_model, pipe.policies())
+        mode = str(policy.get("approval_mode") or v.APPROVAL_MODE or "").strip().lower()
         if mode not in APPROVAL_MODES:
             log.warning("hermes runs pipe: unknown approval mode %r, using ask", mode)
             mode = "ask"
         self.approval_mode = mode
-        self.allowed_choices = entry.get("allowed_approval_choices") or v.ALLOWED_APPROVAL_CHOICES
-        self.auto_choice = str(entry.get("auto_choice") or v.AUTO_CHOICE)
-        self.allowed_roles = entry.get("allowed_roles") or v.ALLOWED_ROLES
+        self.allowed_choices = policy.get("allowed_approval_choices") or v.ALLOWED_APPROVAL_CHOICES
+        self.auto_choice = str(policy.get("auto_choice") or v.AUTO_CHOICE)
+        self.allowed_roles = policy.get("allowed_roles") or v.ALLOWED_ROLES
+
+    def run_body(self, text: str) -> dict:
+        """Returns the POST /runs body; model and provider only for a discovered model, not for the default entry."""
+        body: dict = {"input": text, "stream": False}
+        if self.run_model:
+            body["model"] = self.run_model
+            if self.run_provider:
+                body["provider"] = self.run_provider
+        return body
 
     def headers(self, pipe: "Pipe", **extra: str) -> dict:
         h = {"Accept-Encoding": "identity"}
@@ -312,9 +371,29 @@ class Pipe:
             default="",
             description="Bearer token for Hermes; empty = no Authorization header",
         )
-        MODELS: str = Field(
-            default='[{"id":"hermes-runs","name":"Hermes Runs"}]',
-            description="JSON list of models; an entry can override approval_mode, allowed_approval_choices, auto_choice and allowed_roles",
+        MODEL_DISCOVERY: bool = Field(
+            default=True,
+            description="Load the manifold models from GET <HERMES_BASE_URL>/models; off = one entry with the gateway default",
+        )
+        MODEL_FILTER: str = Field(
+            default="",
+            description="Regex on the model id (search); only matching ids are listed; empty = all",
+        )
+        OWNED_BY_FILTER: str = Field(
+            default="",
+            description="Comma-separated owned_by values to list; empty = all",
+        )
+        MODELS_CACHE_TTL: int = Field(
+            default=300,
+            description="Seconds to cache the model list; on a fetch error the last list stays",
+        )
+        MODEL_POLICIES: str = Field(
+            default="[]",
+            description='JSON list of {"match": <regex on model id>, "approval_mode", "allowed_approval_choices", "auto_choice", "allowed_roles"}; first match wins',
+        )
+        ROUTE_HEADER: str = Field(
+            default="X-Hermes-Route",
+            description="Response header of POST /runs that is shown as a status line (routing proxies); empty = off",
         )
         REQUEST_TIMEOUT: int = Field(
             default=30,
@@ -357,8 +436,12 @@ class Pipe:
         self.type = "manifold"
         self.valves = self.Valves()
         self._client_factory: Callable[[], Any] = self._default_client
+        self._now: Callable[[], float] = time.monotonic
         self._resets: dict[tuple, int] = {}
         self._pending: dict[tuple, dict] = {}
+        self._models: list[dict] = []
+        self._models_at: Optional[float] = None
+        self._models_lock = asyncio.Lock()
 
     @staticmethod
     def _default_client() -> Any:
@@ -366,16 +449,65 @@ class Pipe:
             raise RuntimeError("aiohttp is not installed")
         return aiohttp.ClientSession()
 
-    def pipes(self) -> list[dict]:
-        return [{"id": m["id"], "name": m["name"]} for m in parse_models(self.valves.MODELS)]
+    def policies(self) -> list[dict]:
+        return parse_policies(self.valves.MODEL_POLICIES)
 
-    def model_entry(self, model: str) -> dict:
-        """Returns the MODELS entry for an Open WebUI model id (<function id>.<model id>), else {}."""
-        short = model.split(".", 1)[1] if "." in model else model
-        for entry in parse_models(self.valves.MODELS):
-            if entry["id"] in (model, short):
-                return entry
-        return {}
+    @staticmethod
+    def short_model_id(model: str) -> str:
+        """Returns the manifold entry id of an Open WebUI model id (<function id>.<entry id>)."""
+        return model.split(".", 1)[1] if "." in model else model
+
+    def _discovery_headers(self) -> dict:
+        h = {"Accept": "application/json"}
+        if self.valves.HERMES_API_KEY:
+            h["Authorization"] = f"Bearer {self.valves.HERMES_API_KEY}"
+        return h
+
+    async def _fetch_models(self) -> list[dict]:
+        """Loads GET <base>/models and applies the filters. Raises on network or HTTP errors."""
+        base = str(self.valves.HERMES_BASE_URL or "").rstrip("/")
+        async with self._client_factory() as client:
+            async with client.get(f"{base}/models", headers=self._discovery_headers(),
+                                  timeout=self._timeout()) as resp:
+                if resp.status != 200:
+                    raise _HttpError(resp.status, _error_text(await self._json(resp)))
+                data = await self._json(resp)
+        return parse_model_list(data, self.valves.MODEL_FILTER, self.valves.OWNED_BY_FILTER)
+
+    async def models(self) -> list[dict]:
+        """Returns the manifold entries: the discovered list (cached MODELS_CACHE_TTL seconds), the last
+        list after a fetch error, else the single default entry (gateway default, no model in the run body).
+        """
+        if not self.valves.MODEL_DISCOVERY:
+            return [dict(DEFAULT_MODEL)]
+        async with self._models_lock:
+            now = self._now()
+            fresh = self._models_at is not None and now - self._models_at < max(0, self.valves.MODELS_CACHE_TTL)
+            if not fresh:
+                try:
+                    models = await self._fetch_models()
+                except Exception as e:
+                    log.warning("hermes runs pipe: model discovery failed (%s), %s", e,
+                                "keeping the last list" if self._models else "using the default entry")
+                else:
+                    if not models:
+                        log.warning("hermes runs pipe: model discovery returned no model after the filters")
+                    self._models, self._models_at = models, now
+            return [dict(m) for m in self._models] or [dict(DEFAULT_MODEL)]
+
+    async def pipes(self) -> list[dict]:
+        return [{"id": m["id"], "name": m["name"]} for m in await self.models()]
+
+    def model_entry(self, short_id: str) -> dict:
+        """Returns the cached manifold entry for a short model id; the default entry for its id; else {}.
+        A model that is not in the cache (for example after a restart) is sent to Hermes as given.
+        """
+        if short_id == DEFAULT_MODEL["id"]:
+            return dict(DEFAULT_MODEL)
+        for entry in self._models:
+            if entry["id"] == short_id:
+                return dict(entry)
+        return {"id": short_id} if short_id else {}
 
     def _timeout(self, total: Optional[float] = None) -> Any:
         if total is None:
@@ -498,7 +630,7 @@ class Pipe:
         """Starts a run with the last user message and follows it."""
         try:
             status, data, headers = await self._request(
-                client, "post", ctx, "/runs", {"input": text, "stream": False},
+                client, "post", ctx, "/runs", ctx.run_body(text),
                 **{"Idempotency-Key": idempotency_key(ctx.chat_id, ctx.message_id)})
         except NETWORK_ERRORS as e:
             log.warning("hermes runs pipe: POST /runs failed: %s", e)
@@ -510,6 +642,10 @@ class Pipe:
             return
         if self.valves.DEBUG:
             log.debug("hermes runs pipe: run %s, session %s", run_id, headers.get("X-Hermes-Session-Id"))
+        route_header = str(self.valves.ROUTE_HEADER or "").strip()
+        route = headers.get(route_header) if route_header else None
+        if isinstance(route, str) and route.strip():
+            await self._status(emit, f"Route: {route.strip()[:100]}")
         await self._status(emit, "Hermes arbeitet")
         async with aclosing(self._follow(client, ctx, _Run(run_id), emit, call)) as chunks:
             async for chunk in chunks:

@@ -35,7 +35,7 @@ Falls der Filter deaktiviert ist oder kein Event-Emitter vorhanden ist (z. B. Ta
 
 ## Pipe `hermes_runs_pipe.py`
 
-Manifold-Pipe: jeder Eintrag in `MODELS` erscheint als eigenes Modell. Ein Chat läuft als Hermes-Run über `/v1/runs`. Spezifikation: [`docs/spec/hermes-runs-pipe.md`](../docs/spec/hermes-runs-pipe.md) (Abschnitt 10 gilt vor 2, 3 und 5), Entscheidung: [ADR 0002](../docs/decisions/0002-runs-pipe.md).
+Manifold-Pipe: die Modelle kommen per Discovery aus `GET <HERMES_BASE_URL>/models` (OpenAI-Format), jedes erscheint als eigenes Modell in Open WebUI. Ein Chat läuft als Hermes-Run über `/v1/runs`; die gewählte Modell-ID geht als `model` in den Run-Body. Spezifikation: [`docs/spec/hermes-runs-pipe.md`](../docs/spec/hermes-runs-pipe.md) (Abschnitt 10 gilt vor 2, 3 und 5), Entscheidung: [ADR 0002](../docs/decisions/0002-runs-pipe.md).
 
 ### Installation
 
@@ -50,7 +50,12 @@ Manifold-Pipe: jeder Eintrag in `MODELS` erscheint als eigenes Modell. Ein Chat 
 |---|---|---|---|
 | `HERMES_BASE_URL` | `str` | `http://hermes-gw.hermes:8642/v1` | Basis-URL der Hermes-API (über `owui-relay` und `hermes-models`) |
 | `HERMES_API_KEY` | `str` | `""` | Bearer-Token; leer = kein `Authorization`-Header |
-| `MODELS` | `str` (JSON) | `[{"id":"hermes-runs","name":"Hermes Runs"}]` | Modelle des Manifolds; ein Eintrag darf `approval_mode`, `allowed_approval_choices`, `auto_choice`, `allowed_roles` überschreiben. Ungültiges JSON: Standard-Eintrag und Warnung im Log |
+| `MODEL_DISCOVERY` | `bool` | `True` | Modelle aus `GET <HERMES_BASE_URL>/models` laden. `False`: genau ein Eintrag `Hermes (Gateway-Default)` ohne `model` im Run-Body |
+| `MODEL_FILTER` | `str` (Regex) | `""` | Nur Modell-IDs, auf die der Regex passt (`re.search`); leer = alle |
+| `OWNED_BY_FILTER` | `str` | `""` | Nur Modelle mit diesen `owned_by`-Werten, kommagetrennt; leer = alle |
+| `MODELS_CACHE_TTL` | `int` | `300` | Sekunden Cache für die Modellliste. Fehler beim Laden: letzte Liste bleibt; ohne Liste der Eintrag `Hermes (Gateway-Default)` |
+| `MODEL_POLICIES` | `str` (JSON) | `[]` | Liste von `{"match": <Regex auf Modell-ID>, ...}`; erster Treffer gilt und darf `approval_mode`, `allowed_approval_choices`, `auto_choice`, `allowed_roles` überschreiben. Ungültiges JSON: keine Policies und Warnung im Log |
+| `ROUTE_HEADER` | `str` | `X-Hermes-Route` | Antwort-Header von `POST /runs`, der als Statuszeile `Route: ...` erscheint (für Routing-Proxys); leer = aus |
 | `REQUEST_TIMEOUT` | `int` | `30` | Sekunden für `POST /runs`, `/approval`, `/clarify`, `/stop`, `GET /runs/{id}` |
 | `STREAM_IDLE_TIMEOUT` | `int` | `900` | Sekunden ohne Event im Stream (Keepalives zählen nicht), dann `stop` und Fehlerzeile |
 | `APPROVAL_MODE` | `str` | `ask` | `ask` Dialog, `auto` ohne Dialog mit `AUTO_CHOICE`, `deny` immer `deny` |
@@ -61,22 +66,37 @@ Manifold-Pipe: jeder Eintrag in `MODELS` erscheint als eigenes Modell. Ein Chat 
 | `ALLOWED_ROLES` | `str` | `admin` | Open-WebUI-Rollen mit Zugang, kommagetrennt; `*` = alle |
 | `DEBUG` | `bool` | `False` | Debug-Logging (auch `X-Hermes-Session-Id`) |
 
-### `MODELS`-Beispiel
+### Modell-Discovery
+
+- Anzeigename aus `name`, sonst die `id`. Ein Feld `provider` im Upstream-Eintrag geht als `provider` in den Run-Body.
+- Open WebUI ruft `pipes()` beim Laden der Modellliste auf; die Pipe hält das Ergebnis `MODELS_CACHE_TTL` Sekunden. `pipes()` ist `async`: Open WebUI v0.12.4 (`backend/open_webui/functions.py`, `get_function_models`) prüft `asyncio.iscoroutinefunction` und wartet auf die Coroutine; ein Fehler dort ergibt eine leere Liste, deshalb liefert die Pipe immer mindestens einen Eintrag.
+- Nach einem Neustart von Open WebUI kennt die Pipe die Liste erst nach dem nächsten `pipes()`-Aufruf. Ein Modell, das nicht im Cache ist, wird unverändert als `model` an Hermes gesendet.
+- Einziger eingebauter Eintrag: `hermes-default` (`Hermes (Gateway-Default)`). Er sendet kein `model`, Hermes nimmt dann seinen Standard.
+
+### `MODEL_POLICIES`-Beispiel
 
 ```json
 [
-  {"id": "hermes-runs", "name": "Hermes Runs", "approval_mode": "auto", "auto_choice": "session"},
-  {"id": "hermes-runs-guarded", "name": "Hermes Runs (Freigabe)", "approval_mode": "ask",
-   "allowed_approval_choices": "once,deny", "allowed_roles": "admin,user"}
+  {"match": "^auto", "approval_mode": "auto", "auto_choice": "session"},
+  {"match": ".*", "approval_mode": "ask", "allowed_approval_choices": "once,deny", "allowed_roles": "admin,user"}
 ]
 ```
 
-- `hermes-runs`: für die Owner-Gruppe; Freigaben ohne Dialog. Sichtbarkeit nur für diese Gruppe setzen.
-- `hermes-runs-guarded`: Vorlage für andere Nutzer; jede Freigabe als Ja/Nein-Dialog, nur `once` oder `deny`.
+- Erste Regel: alle Modelle, deren ID mit `auto` beginnt, laufen ohne Freigabe-Dialog. Sichtbarkeit dieser Modelle nur für die Owner-Gruppe setzen (Modellrechte in Open WebUI).
+- Zweite Regel: alle anderen Modelle; jede Freigabe als Ja/Nein-Dialog, nur `once` oder `deny`.
+- Ohne Treffer gelten die globalen Valves (`APPROVAL_MODE`, `ALLOWED_APPROVAL_CHOICES`, `AUTO_CHOICE`, `ALLOWED_ROLES`).
+
+### Betrieb hinter einem Routing-Proxy
+
+Steht vor Hermes ein Proxy, der `/v1/models` mit eigenen Modell-IDs beantwortet (z. B. Klassen wie `auto`, `auto-medium`, `auto-strong` plus durchgereichte Provider-Modelle), listet die Pipe genau diese IDs. Typische Einstellung:
+
+- `OWNED_BY_FILTER=hermes`: nur die Proxy-Klassen anzeigen, nicht die Provider-Modelle, die Open WebUI vielleicht schon direkt kennt.
+- `ROUTE_HEADER`: Liefert der Proxy einen Header mit der gewählten Route, zeigt die Pipe ihn als Statuszeile.
+- Fällt der Proxy weg, zeigt `/v1/models` von Hermes dessen Modelle; die Pipe braucht keine Änderung.
 
 ### Verhalten
 
-- Request an Hermes: `POST /runs` mit `{"input": <letzte Nutzernachricht>, "stream": false}` und `Idempotency-Key: owui:<chat_id>:<message_id>`; danach `GET /runs/{id}/events` (SSE).
+- Request an Hermes: `POST /runs` mit `{"input": <letzte Nutzernachricht>, "stream": false, "model": <gewählte ID>}` (plus `provider`, falls die Discovery eines liefert; ohne `model` beim Eintrag `hermes-default`) und `Idempotency-Key: owui:<chat_id>:<message_id>`; danach `GET /runs/{id}/events` (SSE).
 - Header an alle Requests: `X-Hermes-Session-Key: owui:<user_id>:<chat_id>` (Hermes lädt die Historie selbst), `X-Hermes-User-Role`, `X-Hermes-User-Name` (URL-kodiert wie bei Open WebUI), `Accept-Encoding: identity`, `Authorization` falls Key gesetzt.
 - Text (`message.delta`, `message.interim`, Rest von `run.completed.output`) geht als `content` in den Stream.
 - Tool-Fortschritt: `__event_emitter__` Typ `status` und zusätzlich `delta.reasoning_content`-Chunks (Dict). Open WebUI v0.12.4 (`functions.py`, `process_line`) gibt ein Dict als `data: <json>` weiter, die Middleware liest `delta.reasoning_content` als Reasoning-Block. Ohne `stream` verbindet Open WebUI alle Chunks mit `str()`; dann sendet die Pipe keine Dict-Chunks, nur Status-Events.

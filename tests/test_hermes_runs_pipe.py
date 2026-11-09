@@ -1,4 +1,5 @@
 import asyncio
+import inspect
 import json
 import sys
 import unittest
@@ -23,8 +24,15 @@ async def _collect(agen):
 BASE = "http://hermes.test/v1"
 USER = {"id": "u1", "name": "Owner", "role": "admin"}
 META = {"chat_id": "c1", "message_id": "m1", "session_id": "s1"}
-MODEL = "hermes_runs_pipe.hermes-runs"
+MODEL = "hermes_runs_pipe.auto"
 HANG = object()
+
+MODELS_RESP = {"object": "list", "data": [
+    {"id": "auto", "object": "model", "owned_by": "hermes", "name": "Hermes · Auto"},
+    {"id": "auto-medium", "object": "model", "owned_by": "hermes", "name": "Hermes · Mittel"},
+    {"id": "auto-strong", "object": "model", "owned_by": "hermes"},
+    {"id": "anthropic/claude", "object": "model", "owned_by": "bifrost", "name": "Claude", "provider": "bifrost"},
+]}
 
 
 def ev(name, **fields):
@@ -105,13 +113,15 @@ class FakeClient:
         return [c for c in self.calls if c[0] == method and c[1] == path]
 
 
-def make_pipe(*streams, extra=None, **valves):
-    """Returns (pipe, client); each stream is the chunk list of one GET /runs/r1/events."""
+def make_pipe(*streams, extra=None, models=None, **valves):
+    """Returns (pipe, client); each stream is the chunk list of one GET /runs/r1/events.
+    The model cache is filled with MODELS_RESP (or models) so that the run body carries the model."""
     p = pipe_mod.Pipe()
     p.valves.HERMES_BASE_URL = BASE
     for key, value in valves.items():
         setattr(p.valves, key, value)
     script = {
+        ("GET", "/models"): FakeResp(200, MODELS_RESP),
         ("POST", "/runs"): FakeResp(202, {"run_id": "r1", "status": "queued"}),
         ("GET", "/runs/r1/events"): [FakeResp(chunks=s) for s in streams] or [FakeResp(chunks=[])],
         ("POST", "/runs/r1/approval"): FakeResp(200, {"object": "hermes.run.approval_response", "resolved": 1}),
@@ -121,6 +131,8 @@ def make_pipe(*streams, extra=None, **valves):
     script.update(extra or {})
     client = FakeClient(script)
     p._client_factory = lambda: client
+    p._models = pipe_mod.parse_model_list(MODELS_RESP if models is None else models)
+    p._models_at = p._now()
     return p, client
 
 
@@ -164,15 +176,34 @@ class Dialog:
 
 
 class TestHelpers(unittest.TestCase):
-    def test_parse_models_default_and_bad_json(self):
-        self.assertEqual(pipe_mod.parse_models('[{"id":"hermes-runs","name":"Hermes Runs"}]'),
-                         [{"id": "hermes-runs", "name": "Hermes Runs"}])
+    def test_parse_policies(self):
+        policies = pipe_mod.parse_policies('[{"match":"^auto","approval_mode":"auto"},{"match":".*","allowed_roles":"admin,user"}]')
+        self.assertEqual(len(policies), 2)
+        self.assertEqual(pipe_mod.policy_for("auto-strong", policies), {"approval_mode": "auto"})
+        self.assertEqual(pipe_mod.policy_for("anthropic/claude", policies), {"allowed_roles": "admin,user"})
+        self.assertEqual(pipe_mod.policy_for("x", []), {})
         with self.assertLogs(pipe_mod.log, level="WARNING"):
-            self.assertEqual(pipe_mod.parse_models("{not json"), pipe_mod.DEFAULT_MODELS)
+            self.assertEqual(pipe_mod.parse_policies("{not json"), [])
         with self.assertLogs(pipe_mod.log, level="WARNING"):
-            self.assertEqual(pipe_mod.parse_models('[{"name":"no id"}]'), pipe_mod.DEFAULT_MODELS)
-        models = pipe_mod.parse_models('[{"id":" x ","approval_mode":"deny"}]')
-        self.assertEqual(models, [{"id": "x", "name": "x", "approval_mode": "deny"}])
+            self.assertEqual(pipe_mod.parse_policies('[{"match":"(","approval_mode":"auto"}]'), [])
+        self.assertEqual(pipe_mod.parse_policies(""), [])
+        self.assertEqual(pipe_mod.parse_policies('[{"approval_mode":"auto"}]'), [])
+
+    def test_parse_model_list(self):
+        models = pipe_mod.parse_model_list(MODELS_RESP)
+        self.assertEqual([m["id"] for m in models], ["auto", "auto-medium", "auto-strong", "anthropic/claude"])
+        self.assertEqual(models[0]["name"], "Hermes · Auto")
+        self.assertEqual(models[2]["name"], "auto-strong")
+        self.assertEqual(models[3]["provider"], "bifrost")
+        self.assertNotIn("provider", models[0])
+        self.assertEqual([m["id"] for m in pipe_mod.parse_model_list(MODELS_RESP, id_filter="^auto")],
+                         ["auto", "auto-medium", "auto-strong"])
+        self.assertEqual([m["id"] for m in pipe_mod.parse_model_list(MODELS_RESP, owned_by_csv="bifrost")],
+                         ["anthropic/claude"])
+        self.assertEqual(pipe_mod.parse_model_list({"data": "x"}), [])
+        self.assertEqual(pipe_mod.parse_model_list({"data": [{"name": "no id"}]}), [])
+        with self.assertLogs(pipe_mod.log, level="WARNING"):
+            self.assertEqual(len(pipe_mod.parse_model_list(MODELS_RESP, id_filter="(")), 4)
 
     def test_session_key(self):
         self.assertEqual(pipe_mod.session_key("u1", "c1"), "owui:u1:c1")
@@ -254,12 +285,109 @@ class TestHelpers(unittest.TestCase):
         self.assertEqual(pipe_mod.remaining_output("Neu", ""), "Neu")
         self.assertEqual(pipe_mod.remaining_output(None, "x"), "")
 
-    def test_manifold_pipes_list(self):
+    def test_manifold_type(self):
         p = pipe_mod.Pipe()
         self.assertEqual(p.type, "manifold")
-        self.assertEqual(p.pipes(), [{"id": "hermes-runs", "name": "Hermes Runs"}])
-        p.valves.MODELS = json.dumps([{"id": "a", "name": "A", "approval_mode": "auto"}, {"id": "b"}])
-        self.assertEqual(p.pipes(), [{"id": "a", "name": "A"}, {"id": "b", "name": "b"}])
+        self.assertTrue(inspect.iscoroutinefunction(p.pipes))
+
+
+class TestDiscovery(unittest.TestCase):
+    def _pipe(self, **valves):
+        p, client = make_pipe(**valves)
+        p._models, p._models_at = [], None
+        p._clock = [1000.0]
+        p._now = lambda: p._clock[0]
+        return p, client
+
+    def test_pipes_from_discovery_with_filters(self):
+        p, client = self._pipe()
+        self.assertEqual(asyncio.run(p.pipes()), [
+            {"id": "auto", "name": "Hermes · Auto"}, {"id": "auto-medium", "name": "Hermes · Mittel"},
+            {"id": "auto-strong", "name": "auto-strong"}, {"id": "anthropic/claude", "name": "Claude"}])
+        self.assertEqual(client.calls[0][:2], ("GET", "/models"))
+        self.assertEqual(client.calls[0][2]["Accept"], "application/json")
+        p, _ = self._pipe(OWNED_BY_FILTER="hermes", MODEL_FILTER="^auto(-strong)?$")
+        self.assertEqual([m["id"] for m in asyncio.run(p.pipes())], ["auto", "auto-strong"])
+        p, _ = self._pipe(HERMES_API_KEY="k1")
+        asyncio.run(p.pipes())
+
+    def test_cache_ttl(self):
+        p, client = self._pipe(MODELS_CACHE_TTL=300)
+        asyncio.run(p.pipes())
+        p._clock[0] += 299
+        asyncio.run(p.pipes())
+        self.assertEqual(len(client.find("GET", "/models")), 1)
+        p._clock[0] += 2
+        asyncio.run(p.pipes())
+        self.assertEqual(len(client.find("GET", "/models")), 2)
+
+    def test_fetch_error_keeps_last_list_or_default(self):
+        p, client = self._pipe(MODELS_CACHE_TTL=0)
+        asyncio.run(p.pipes())
+        client.script[("GET", "/models")] = [FakeResp(exc=ConnectionRefusedError("down"))]
+        with self.assertLogs(pipe_mod.log, level="WARNING"):
+            self.assertEqual([m["id"] for m in asyncio.run(p.pipes())], ["auto", "auto-medium", "auto-strong", "anthropic/claude"])
+        p, client = self._pipe(extra={("GET", "/models"): FakeResp(exc=ConnectionRefusedError("down"))})
+        with self.assertLogs(pipe_mod.log, level="WARNING"):
+            self.assertEqual(asyncio.run(p.pipes()), [{"id": "hermes-default", "name": "Hermes (Gateway-Default)"}])
+        p, client = self._pipe(extra={("GET", "/models"): FakeResp(503, {"error": "busy"})})
+        with self.assertLogs(pipe_mod.log, level="WARNING"):
+            self.assertEqual(asyncio.run(p.pipes())[0]["id"], "hermes-default")
+
+    def test_discovery_off(self):
+        p, client = self._pipe(MODEL_DISCOVERY=False)
+        self.assertEqual(asyncio.run(p.pipes()), [{"id": "hermes-default", "name": "Hermes (Gateway-Default)"}])
+        self.assertEqual(client.calls, [])
+
+    def test_run_body_model_and_provider(self):
+        p, client = make_pipe(sse(DONE))
+        run_pipe(p, model="hermes_runs_pipe.auto")
+        self.assertEqual(client.find("POST", "/runs")[0][3], {"input": "Hallo", "stream": False, "model": "auto"})
+        p, client = make_pipe(sse(DONE))
+        run_pipe(p, model="hermes_runs_pipe.anthropic/claude")
+        self.assertEqual(client.find("POST", "/runs")[0][3],
+                         {"input": "Hallo", "stream": False, "model": "anthropic/claude", "provider": "bifrost"})
+        p, client = make_pipe(sse(DONE))
+        run_pipe(p, model="hermes_runs_pipe.hermes-default")
+        self.assertEqual(client.find("POST", "/runs")[0][3], {"input": "Hallo", "stream": False})
+        # A model that is not in the cache (for example after a restart) is passed on as given.
+        p, client = make_pipe(sse(DONE), models={"data": []})
+        run_pipe(p, model="hermes_runs_pipe.auto-strong")
+        self.assertEqual(client.find("POST", "/runs")[0][3]["model"], "auto-strong")
+
+    def test_policy_first_match(self):
+        policies = json.dumps([{"match": "^auto", "approval_mode": "auto", "auto_choice": "session"},
+                               {"match": ".*", "approval_mode": "ask", "allowed_approval_choices": "once,deny",
+                                "allowed_roles": "admin,user"}])
+        p, client = make_pipe(sse(APPROVAL, DONE), MODEL_POLICIES=policies)
+        dialog = Dialog()
+        run_pipe(p, call=dialog, model="hermes_runs_pipe.auto-strong")
+        self.assertEqual(dialog.events, [])
+        self.assertEqual(client.find("POST", "/runs/r1/approval")[-1][3]["choice"], "session")
+        dialog = Dialog(True)
+        run_pipe(p, call=dialog, model="hermes_runs_pipe.anthropic/claude",
+                 user={"id": "u2", "name": "Kind", "role": "user"})
+        self.assertEqual(dialog.events[0]["type"], "confirmation")
+        self.assertEqual(client.find("POST", "/runs/r1/approval")[-1][3]["choice"], "once")
+        with self.assertLogs(pipe_mod.log, level="WARNING"):
+            p, client = make_pipe(sse(APPROVAL_ONCE_DENY, DONE), MODEL_POLICIES="{bad")
+            run_pipe(p, call=Dialog(True))
+        self.assertEqual(client.find("POST", "/runs/r1/approval")[-1][3]["choice"], "once")
+
+    def test_route_header_status(self):
+        p, _ = make_pipe(sse(DONE), extra={("POST", "/runs"): FakeResp(
+            202, {"run_id": "r1"}, headers={"X-Hermes-Route": "tier-complex via chat-floor"})})
+        _, emitted = run_pipe(p)
+        descriptions = [e["data"]["description"] for e in emitted]
+        self.assertEqual(descriptions[0], "Route: tier-complex via chat-floor")
+        self.assertEqual(descriptions[1], "Hermes arbeitet")
+        p, _ = make_pipe(sse(DONE))
+        _, emitted = run_pipe(p)
+        self.assertFalse(any(e["data"]["description"].startswith("Route:") for e in emitted))
+        p, _ = make_pipe(sse(DONE), ROUTE_HEADER="", extra={("POST", "/runs"): FakeResp(
+            202, {"run_id": "r1"}, headers={"X-Hermes-Route": "x"})})
+        _, emitted = run_pipe(p)
+        self.assertFalse(any(e["data"]["description"].startswith("Route:") for e in emitted))
 
 
 APPROVAL = ev("approval.request", request_id="a1", command="rm -rf /tmp/x", description="Löscht Dateien",
@@ -418,7 +546,7 @@ class TestPipe(unittest.TestCase):
         run_pipe(p, user={"id": "u1", "name": "Jörg Ü", "role": "admin"})
         method, path, headers, payload = client.calls[0]
         self.assertEqual((method, path), ("POST", "/runs"))
-        self.assertEqual(payload, {"input": "Hallo", "stream": False})
+        self.assertEqual(payload, {"input": "Hallo", "stream": False, "model": "auto"})
         self.assertEqual(headers["X-Hermes-Session-Key"], "owui:u1:c1")
         self.assertEqual(headers["X-Hermes-User-Role"], "admin")
         self.assertEqual(headers["X-Hermes-User-Name"], "J%C3%B6rg %C3%9C")
@@ -489,21 +617,21 @@ class TestPipe(unittest.TestCase):
         self.assertEqual(chunks, ["Dieses Modell ist für dein Konto nicht freigegeben"])
         self.assertEqual(client.calls, [])
 
-    def test_manifold_pipes(self):
-        # Spec test 22.
-        models = [{"id": "hermes-runs", "name": "Hermes Runs", "approval_mode": "auto"},
-                  {"id": "hermes-runs-guarded", "name": "Hermes Runs (Freigabe)", "approval_mode": "ask",
-                   "allowed_approval_choices": "once,deny", "allowed_roles": "admin,user"}]
-        p, client = make_pipe(sse(APPROVAL, DONE), MODELS=json.dumps(models))
-        self.assertEqual(p.pipes(), [{"id": "hermes-runs", "name": "Hermes Runs"},
-                                     {"id": "hermes-runs-guarded", "name": "Hermes Runs (Freigabe)"}])
+    def test_manifold_policies_per_model(self):
+        # Spec test 22 (0.2.0: policies per regex instead of MODELS entries).
+        policies = json.dumps([{"match": "^auto$", "approval_mode": "auto"},
+                               {"match": "guarded|claude", "approval_mode": "ask",
+                                "allowed_approval_choices": "once,deny", "allowed_roles": "admin,user"}])
+        p, client = make_pipe(sse(APPROVAL, DONE), MODEL_POLICIES=policies)
+        self.assertEqual([m["id"] for m in asyncio.run(p.pipes())],
+                         ["auto", "auto-medium", "auto-strong", "anthropic/claude"])
         dialog = Dialog()
-        run_pipe(p, call=dialog, model="hermes_runs_pipe.hermes-runs")
+        run_pipe(p, call=dialog, model="hermes_runs_pipe.auto")
         self.assertEqual(dialog.events, [])
         self.assertEqual(client.find("POST", "/runs/r1/approval")[-1][3]["choice"], "session")
 
         dialog = Dialog(True)
-        run_pipe(p, call=dialog, model="hermes_runs_pipe.hermes-runs-guarded",
+        run_pipe(p, call=dialog, model="hermes_runs_pipe.anthropic/claude",
                  user={"id": "u2", "name": "Kind", "role": "user"})
         self.assertEqual(dialog.events[0]["type"], "confirmation")
         self.assertEqual(client.find("POST", "/runs/r1/approval")[-1][3]["choice"], "once")
