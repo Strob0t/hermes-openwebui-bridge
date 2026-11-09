@@ -11,3 +11,7 @@ Dieses Verzeichnis enthält die Recherche, Ist-Analysen und Architekturentscheid
 
 - **Architekturentscheidungen (`docs/decisions/`)**:
   - `0001-filter-not-pipe.md`: Entscheidung für einen Open-WebUI-Filter statt einer Pipe für Embeds.
+  - `0002-runs-pipe.md`: Pipe für Hermes `/v1/runs` (Freigaben, Session-Header, Manifold).
+
+- **Spezifikationen (`docs/spec/`)**:
+  - `hermes-runs-pipe.md`: Spezifikation der Runs-Pipe (Abschnitt 10 gilt vor 2, 3 und 5).

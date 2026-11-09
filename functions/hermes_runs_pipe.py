@@ -11,7 +11,10 @@ import asyncio
 import json
 import logging
 import re
+import string
+from contextlib import aclosing
 from typing import Any, AsyncIterator, Awaitable, Callable, Optional
+from urllib.parse import quote
 
 try:
     import aiohttp
@@ -40,8 +43,14 @@ APPROVAL_CHOICES = ("once", "session", "always", "deny")
 APPROVAL_MODES = ("ask", "auto", "deny")
 CHOICE_ALIASES = {"approve": "once", "approved": "once", "allow": "once"}
 SLASH_COMMANDS = ("reset", "approve", "deny")
-TERMINAL_EVENTS = ("run.completed", "run.failed", "run.cancelled", "run.interrupted")
+TERMINAL_STATUSES = ("completed", "failed", "cancelled", "interrupted")
 MAX_RECONNECTS = 3
+NETWORK_ERRORS: tuple = (OSError, asyncio.TimeoutError) + ((aiohttp.ClientError,) if aiohttp else ())
+APPROVAL_TITLE = "Hermes braucht eine Freigabe"
+TEXT_DENIED = "Dieses Modell ist für dein Konto nicht freigegeben"
+TEXT_RESET = "Session zurückgesetzt"
+TEXT_NO_PENDING = "Keine offene Freigabe in diesem Chat."
+TEXT_NO_INPUT = "Keine Nutzernachricht gefunden."
 
 
 def _csv(value: Any) -> list[str]:
@@ -197,9 +206,100 @@ def remaining_output(output: Any, streamed: str) -> str:
     return f"\n\n{output}" if streamed else output
 
 
-def _header_value(value: Any, limit: int = 200) -> str:
-    """Returns the value as a header-safe string without control characters."""
-    return re.sub(r"[\x00-\x1f\x7f]", " ", str(value or "")).strip()[:limit]
+def _header_text(value: Any) -> str:
+    """Returns the value URL-quoted like Open WebUI custom headers such as {{USER_NAME}} (utils/headers.py)."""
+    return quote(str(value or "").strip(), safe=string.punctuation + " ")
+
+
+def _error_text(data: Any, limit: int = 300) -> str:
+    """Returns the error message of a Hermes/OpenAI error body, shortened."""
+    if isinstance(data, dict):
+        err = data.get("error")
+        data = err.get("message") if isinstance(err, dict) else err or data.get("message") or ""
+    return re.sub(r"\s+", " ", str(data or "")).strip()[:limit]
+
+
+def _or_list(items: list[str]) -> str:
+    """Returns "a, b oder c"."""
+    return items[0] if len(items) == 1 else ", ".join(items[:-1]) + " oder " + items[-1]
+
+
+class _IdleTimeout(Exception):
+    pass
+
+
+async def _idle_limited(frames: Any, idle: float) -> AsyncIterator[Any]:
+    """Yields the items of frames; raises _IdleTimeout if no item comes in idle seconds."""
+    it = frames.__aiter__()
+    try:
+        while True:
+            try:
+                item = await asyncio.wait_for(it.__anext__(), idle)
+            except StopAsyncIteration:
+                return
+            except asyncio.TimeoutError:
+                raise _IdleTimeout() from None
+            yield item
+    finally:
+        if hasattr(it, "aclose"):
+            await it.aclose()
+
+
+class _HttpError(Exception):
+    def __init__(self, status: int, detail: str = ""):
+        super().__init__(f"HTTP {status}: {detail}" if detail else f"HTTP {status}")
+        self.status = status
+        self.detail = detail
+
+
+class _Ctx:
+    """Values of one pipe call: ids, user, effective model settings and request headers."""
+
+    def __init__(self, pipe: "Pipe", body: dict, user: dict, metadata: dict):
+        v = pipe.valves
+        self.base = str(v.HERMES_BASE_URL or "").rstrip("/")
+        self.model = str(body.get("model") or "")
+        self.stream = bool(body.get("stream"))
+        self.user_id = str(user.get("id") or "")
+        self.chat_id = str(metadata.get("chat_id") or "")
+        self.message_id = str(metadata.get("message_id") or "")
+        self.role = str(user.get("role") or "")
+        self.name = str(user.get("name") or "")
+        self.key = (self.user_id, self.chat_id)
+        entry = pipe.model_entry(self.model)
+        mode = str(entry.get("approval_mode") or v.APPROVAL_MODE or "").strip().lower()
+        if mode not in APPROVAL_MODES:
+            log.warning("hermes runs pipe: unknown approval mode %r, using ask", mode)
+            mode = "ask"
+        self.approval_mode = mode
+        self.allowed_choices = entry.get("allowed_approval_choices") or v.ALLOWED_APPROVAL_CHOICES
+        self.auto_choice = str(entry.get("auto_choice") or v.AUTO_CHOICE)
+        self.allowed_roles = entry.get("allowed_roles") or v.ALLOWED_ROLES
+
+    def headers(self, pipe: "Pipe", **extra: str) -> dict:
+        h = {"Accept-Encoding": "identity"}
+        if pipe.valves.HERMES_API_KEY:
+            h["Authorization"] = f"Bearer {pipe.valves.HERMES_API_KEY}"
+        if self.chat_id:
+            h["X-Hermes-Session-Key"] = session_key(self.user_id, self.chat_id, pipe._resets.get(self.key, 0))
+        if self.role:
+            h["X-Hermes-User-Role"] = _header_text(self.role)
+        if self.name:
+            h["X-Hermes-User-Name"] = _header_text(self.name)
+        h.update({k: val for k, val in extra.items() if val})
+        return h
+
+
+class _Run:
+    """State of the Hermes run that one pipe call follows."""
+
+    def __init__(self, run_id: str = "", last_id: Optional[str] = None, streamed: str = ""):
+        self.run_id = run_id
+        self.last_id = last_id
+        self.streamed = streamed
+        self.sent_choice = ""
+        self.done = False
+        self.parked = False
 
 
 class Pipe:
@@ -222,7 +322,7 @@ class Pipe:
         )
         STREAM_IDLE_TIMEOUT: int = Field(
             default=900,
-            description="Seconds without data on the event stream, then stop and error",
+            description="Seconds without an event on the event stream (keepalives do not count), then stop and error",
         )
         APPROVAL_MODE: str = Field(
             default="ask",
@@ -257,8 +357,8 @@ class Pipe:
         self.type = "manifold"
         self.valves = self.Valves()
         self._client_factory: Callable[[], Any] = self._default_client
-        self._resets: dict[str, int] = {}
-        self._pending: dict[str, dict] = {}
+        self._resets: dict[tuple, int] = {}
+        self._pending: dict[tuple, dict] = {}
 
     @staticmethod
     def _default_client() -> Any:
@@ -269,6 +369,83 @@ class Pipe:
     def pipes(self) -> list[dict]:
         return [{"id": m["id"], "name": m["name"]} for m in parse_models(self.valves.MODELS)]
 
+    def model_entry(self, model: str) -> dict:
+        """Returns the MODELS entry for an Open WebUI model id (<function id>.<model id>), else {}."""
+        short = model.split(".", 1)[1] if "." in model else model
+        for entry in parse_models(self.valves.MODELS):
+            if entry["id"] in (model, short):
+                return entry
+        return {}
+
+    def _timeout(self, total: Optional[float] = None) -> Any:
+        if total is None:
+            total = self.valves.REQUEST_TIMEOUT
+        if aiohttp is None:
+            return total
+        if total == 0:
+            return aiohttp.ClientTimeout(total=None, sock_connect=self.valves.REQUEST_TIMEOUT)
+        return aiohttp.ClientTimeout(total=total)
+
+    @staticmethod
+    async def _json(resp: Any) -> Any:
+        try:
+            return await resp.json(content_type=None)
+        except Exception:
+            return {}
+
+    async def _request(self, client: Any, method: str, ctx: _Ctx, path: str,
+                       payload: Optional[dict] = None, **headers: str) -> tuple[int, Any, Any]:
+        """Sends one JSON request to Hermes. Returns (status, JSON body, response headers)."""
+        kwargs = {"headers": ctx.headers(self, **headers), "timeout": self._timeout()}
+        if payload is not None:
+            kwargs["json"] = payload
+        async with getattr(client, method)(f"{ctx.base}{path}", **kwargs) as resp:
+            return resp.status, await self._json(resp), getattr(resp, "headers", {}) or {}
+
+    async def _send(self, client: Any, ctx: _Ctx, run: _Run, kind: str, payload: dict) -> tuple[int, str]:
+        """Posts an approval or clarify answer.
+        Returns (HTTP status, "") on success, else (HTTP status or 0 for a network error, error text).
+        """
+        try:
+            status, data, _ = await self._request(client, "post", ctx, f"/runs/{run.run_id}/{kind}", payload)
+        except NETWORK_ERRORS as e:
+            return 0, f"Hermes ist nicht erreichbar ({ctx.base}): {type(e).__name__}"
+        if status >= 300:
+            return status, f"HTTP {status}: {_error_text(data)}".rstrip(": ")
+        return status, ""
+
+    async def _stop(self, client: Any, ctx: _Ctx, run: _Run) -> None:
+        try:
+            await self._request(client, "post", ctx, f"/runs/{run.run_id}/stop", {})
+        except Exception as e:
+            log.warning("hermes runs pipe: stop of run %s failed: %s", run.run_id, e)
+
+    @staticmethod
+    async def _status(emit: Optional[Callable], description: str, done: bool = False) -> None:
+        if emit is None:
+            return
+        try:
+            await emit({"type": "status", "data": {"description": description, "done": done}})
+        except Exception as e:
+            log.debug("hermes runs pipe: status event failed: %s", e)
+
+    @staticmethod
+    def _chunk(ctx: _Ctx, field: str, text: str) -> dict:
+        """Returns an OpenAI chat.completion.chunk with delta.<field> = text."""
+        return {
+            "object": "chat.completion.chunk",
+            "model": ctx.model,
+            "choices": [{"index": 0, "delta": {field: text}, "finish_reason": None}],
+        }
+
+    def _reasoning(self, ctx: _Ctx, text: str) -> Optional[dict]:
+        """Returns a delta.reasoning_content chunk; None if the request does not stream.
+        Without stream, Open WebUI joins str() of all chunks, so a dict would show as text.
+        """
+        if not ctx.stream or not text:
+            return None
+        return self._chunk(ctx, "reasoning_content", text)
+
     async def pipe(
         self,
         body: dict,
@@ -277,4 +454,324 @@ class Pipe:
         __event_emitter__: Optional[Callable[[dict], Awaitable[None]]] = None,
         __event_call__: Optional[Callable[[dict], Awaitable[Any]]] = None,
     ) -> AsyncIterator[Any]:
-        yield "Hermes Runs Pipe: der Run-Ablauf folgt im naechsten Commit."
+        try:
+            body = body if isinstance(body, dict) else {}
+            ctx = _Ctx(self, body, __user__ or {}, __metadata__ or {})
+            if (__metadata__ or {}).get("task"):
+                # Title, tag and follow-up tasks would add turns to the Hermes session of the chat.
+                yield ""
+                return
+            if not role_allowed(ctx.role, ctx.allowed_roles):
+                yield TEXT_DENIED
+                return
+            text = last_user_text(body.get("messages"))
+            slash = parse_slash(text)
+            if slash and slash[0] == "reset":
+                self._resets[ctx.key] = self._resets.get(ctx.key, 0) + 1
+                self._pending.pop(ctx.key, None)
+                yield TEXT_RESET
+                return
+            if slash and ctx.key not in self._pending:
+                yield TEXT_NO_PENDING
+                return
+            if not slash and not text.strip():
+                yield TEXT_NO_INPUT
+                return
+            async with self._client_factory() as client:
+                if slash:
+                    chunks = self._answer_pending(client, ctx, slash, __event_emitter__, __event_call__)
+                else:
+                    chunks = self._start(client, ctx, text, __event_emitter__, __event_call__)
+                async with aclosing(chunks):
+                    async for chunk in chunks:
+                        if ctx.stream and isinstance(chunk, str) and chunk.startswith("data:"):
+                            # Open WebUI passes a str chunk that starts with "data:" on as a raw SSE line.
+                            chunk = self._chunk(ctx, "content", chunk)
+                        yield chunk
+        except (GeneratorExit, asyncio.CancelledError):
+            raise
+        except Exception as e:
+            log.exception("hermes runs pipe failed")
+            yield f"\n\nFehler in der Hermes-Runs-Pipe: {type(e).__name__}: {e}"
+
+    async def _start(self, client: Any, ctx: _Ctx, text: str, emit, call) -> AsyncIterator[Any]:
+        """Starts a run with the last user message and follows it."""
+        try:
+            status, data, headers = await self._request(
+                client, "post", ctx, "/runs", {"input": text, "stream": False},
+                **{"Idempotency-Key": idempotency_key(ctx.chat_id, ctx.message_id)})
+        except NETWORK_ERRORS as e:
+            log.warning("hermes runs pipe: POST /runs failed: %s", e)
+            yield f"Hermes ist nicht erreichbar ({ctx.base})"
+            return
+        run_id = data.get("run_id") if isinstance(data, dict) else None
+        if status >= 300 or not isinstance(run_id, str) or not run_id:
+            yield f"Hermes hat den Run abgelehnt (HTTP {status}: {_error_text(data) or 'keine run_id'})"
+            return
+        if self.valves.DEBUG:
+            log.debug("hermes runs pipe: run %s, session %s", run_id, headers.get("X-Hermes-Session-Id"))
+        await self._status(emit, "Hermes arbeitet")
+        async with aclosing(self._follow(client, ctx, _Run(run_id), emit, call)) as chunks:
+            async for chunk in chunks:
+                yield chunk
+
+    async def _answer_pending(self, client: Any, ctx: _Ctx, slash: tuple[str, str], emit, call) -> AsyncIterator[Any]:
+        """Sends /approve or /deny for the open approval of this chat and follows the run again."""
+        pending = self._pending[ctx.key]
+        command, arg = slash
+        choice = "deny" if command == "deny" else CHOICE_ALIASES.get(arg.lower(), arg.lower()) or "once"
+        if choice != "deny" and choice not in pending["offered"]:
+            yield f"Ungültige Wahl `{arg}`. {self._approve_hint(pending['offered'])}"
+            return
+        del self._pending[ctx.key]
+        run = _Run(pending["run_id"], pending["last_id"], pending["streamed"])
+        status, err = await self._send(client, ctx, run, "approval", {**pending["answer"], "choice": choice})
+        run.sent_choice = choice
+        yield self._approval_line(choice, "", err)
+        if err:
+            if status == 0:
+                # The answer did not reach Hermes: keep the approval open for a new try.
+                self._pending[ctx.key] = pending
+            return
+        await self._status(emit, "Hermes arbeitet")
+        async with aclosing(self._follow(client, ctx, run, emit, call)) as chunks:
+            async for chunk in chunks:
+                yield chunk
+
+    async def _follow(self, client: Any, ctx: _Ctx, run: _Run, emit, call) -> AsyncIterator[Any]:
+        """Follows the run events with reconnects; stops the run if the client ends the stream."""
+        try:
+            async with aclosing(self._events(client, ctx, run, emit, call)) as chunks:
+                async for chunk in chunks:
+                    yield chunk
+        except (GeneratorExit, asyncio.CancelledError):
+            if not run.done and not run.parked:
+                await asyncio.shield(self._stop(client, ctx, run))
+            raise
+        except _IdleTimeout:
+            idle = True
+        except Exception:
+            # pipe() shows the error; do not leave the run without a reader.
+            if not run.done and not run.parked:
+                await self._stop(client, ctx, run)
+            raise
+        else:
+            idle = False
+        if idle:
+            await self._stop(client, ctx, run)
+            await self._status(emit, "Hermes antwortet nicht", done=True)
+            yield f"\n\nKeine Daten von Hermes seit {self.valves.STREAM_IDLE_TIMEOUT} s, Run gestoppt."
+
+    async def _events(self, client: Any, ctx: _Ctx, run: _Run, emit, call) -> AsyncIterator[Any]:
+        """Reads the event stream; reconnects up to MAX_RECONNECTS times, then reads the run status."""
+        for _ in range(1 + MAX_RECONNECTS):
+            try:
+                async with aclosing(self._stream_once(client, ctx, run, emit, call)) as chunks:
+                    async for chunk in chunks:
+                        yield chunk
+            except NETWORK_ERRORS as e:
+                log.warning("hermes runs pipe: event stream of run %s broke: %s", run.run_id, e)
+            except _HttpError as e:
+                log.warning("hermes runs pipe: event stream of run %s: %s", run.run_id, e)
+                if e.status in (401, 403, 404):
+                    break
+            if run.done or run.parked:
+                return
+        if not run.done:
+            async with aclosing(self._final_status(client, ctx, run, emit)) as chunks:
+                async for chunk in chunks:
+                    yield chunk
+
+    async def _stream_once(self, client: Any, ctx: _Ctx, run: _Run, emit, call) -> AsyncIterator[Any]:
+        headers = {"Accept": "text/event-stream"}
+        if run.last_id is not None:
+            headers["Last-Event-ID"] = run.last_id
+        url = f"{ctx.base}/runs/{run.run_id}/events"
+        async with client.get(url, headers=ctx.headers(self, **headers), timeout=self._timeout(0)) as resp:
+            if resp.status != 200:
+                raise _HttpError(resp.status, _error_text(await self._json(resp)))
+            frames = _idle_limited(parse_sse(resp.content.iter_any()), self.valves.STREAM_IDLE_TIMEOUT)
+            async with aclosing(frames):
+                async for frame_id, data in frames:
+                    if frame_id is not None:
+                        run.last_id = frame_id
+                    async with aclosing(self._on_event(client, ctx, run, data, emit, call)) as chunks:
+                        async for chunk in chunks:
+                            yield chunk
+                    if run.done or run.parked:
+                        return
+
+    async def _final_status(self, client: Any, ctx: _Ctx, run: _Run, emit) -> AsyncIterator[Any]:
+        """Reads GET /runs/{id} after the event stream is lost and shows the output."""
+        run.done = True
+        try:
+            status, data, _ = await self._request(client, "get", ctx, f"/runs/{run.run_id}")
+        except NETWORK_ERRORS as e:
+            log.warning("hermes runs pipe: GET run %s failed: %s", run.run_id, e)
+            status, data = 0, {}
+        state = data.get("status") if isinstance(data, dict) else None
+        await self._status(emit, "Verbindung zum Fortschritt verloren", done=True)
+        if status == 200 and state == "completed":
+            yield remaining_output(data.get("output"), run.streamed)
+        elif status == 200 and state in TERMINAL_STATUSES:
+            yield f"\n\nRun {state}: {_error_text(data.get('error')) or 'ohne Fehlertext'}"
+        else:
+            yield (f"\n\nVerbindung zum Fortschritt verloren (Run `{run.run_id}`, Status "
+                   f"{state or status or 'unbekannt'}). Der Run läuft in Hermes eventuell weiter.")
+
+    async def _on_event(self, client: Any, ctx: _Ctx, run: _Run, data: dict, emit, call) -> AsyncIterator[Any]:
+        name = str(data.get("event") or "")
+        show = self.valves.SHOW_TOOL_PROGRESS
+        if name in ("run.queued", "run.running"):
+            await self._status(emit, "Hermes arbeitet")
+        elif name == "message.delta":
+            delta = data.get("delta")
+            if isinstance(delta, str) and delta:
+                run.streamed += delta
+                yield delta
+        elif name == "message.interim":
+            text = data.get("text")
+            if isinstance(text, str) and text.strip() and not data.get("already_streamed"):
+                if run.streamed and not run.streamed.endswith("\n"):
+                    text = "\n\n" + text
+                run.streamed += text
+                yield text
+        elif name == "tool.started" and show:
+            line = f"{data.get('tool') or 'tool'}: {data.get('preview') or ''}".rstrip(": ")
+            await self._status(emit, line[:120])
+            chunk = self._reasoning(ctx, f"> {line}\n")
+            if chunk:
+                yield chunk
+        elif name == "tool.completed" and show:
+            line = f"{data.get('tool') or 'tool'} fertig ({data.get('duration') or 0} s{', Fehler' if data.get('error') else ''})"
+            await self._status(emit, line[:120])
+            chunk = self._reasoning(ctx, f"> {line}\n")
+            if chunk:
+                yield chunk
+        elif name == "reasoning.available":
+            text = str(data.get("text") or "")
+            chunk = self._reasoning(ctx, f"{text}\n") if text.strip() else None
+            if chunk:
+                yield chunk
+        elif name in ("subagent.start", "subagent.complete") and show:
+            label = "Subagent startet" if name == "subagent.start" else "Subagent fertig"
+            await self._status(emit, f"{label}: {data.get('preview') or ''}".rstrip(": ")[:120])
+        elif name == "approval.request":
+            async with aclosing(self._approval(client, ctx, run, data, emit, call)) as chunks:
+                async for chunk in chunks:
+                    yield chunk
+        elif name == "approval.responded":
+            choice = str(data.get("choice") or "")
+            if choice and choice == run.sent_choice:
+                run.sent_choice = ""
+            elif choice:
+                yield f"\n\n*(Freigabe: {choice})*\n\n"
+        elif name == "clarify.request":
+            async with aclosing(self._clarify(client, ctx, run, data, call)) as chunks:
+                async for chunk in chunks:
+                    yield chunk
+        elif name == "replay.truncated":
+            yield "\n\n*(Teile des Fortschritts fehlen)*\n\n"
+        elif name == "run.completed":
+            run.done = True
+            await self._status(emit, "Fertig", done=True)
+            rest = remaining_output(data.get("output"), run.streamed)
+            if rest:
+                yield rest
+        elif name in ("run.failed", "run.cancelled", "run.interrupted"):
+            run.done = True
+            label = {"run.failed": "Run fehlgeschlagen", "run.cancelled": "Run abgebrochen",
+                     "run.interrupted": "Run unterbrochen"}[name]
+            await self._status(emit, label, done=True)
+            error = _error_text(data.get("error"))
+            yield f"\n\n{label}: {error}" if error else f"\n\n{label}."
+        elif self.valves.DEBUG:
+            log.debug("hermes runs pipe: event %s ignored", name)
+
+    @staticmethod
+    def _approve_hint(offered: list[str]) -> str:
+        approve = [c for c in offered if c != "deny"]
+        return f"Antworte mit `/approve [{'|'.join(approve)}]` oder `/deny`." if approve else "Antworte mit `/deny`."
+
+    @staticmethod
+    def _approval_line(choice: str, reason: str, err: str) -> str:
+        if err:
+            return f"\n\n*(Freigabe `{choice}` nicht gesendet: {err})*\n\n"
+        return f"\n\n*(Freigabe: {choice}{', ' + reason if reason else ''})*\n\n"
+
+    async def _ask(self, call, event: dict) -> tuple[Any, str]:
+        """Runs one __event_call__ dialog. Returns (result, "") or (None, reason)."""
+        try:
+            result = await asyncio.wait_for(call(event), self.valves.APPROVAL_TIMEOUT)
+        except asyncio.TimeoutError:
+            return None, "Zeit abgelaufen"
+        except Exception as e:
+            log.warning("hermes runs pipe: dialog failed: %s", e)
+            return None, "Dialog fehlgeschlagen"
+        if isinstance(result, dict) and result.get("error"):
+            return None, "Dialog ohne Antwort"
+        return result, ""
+
+    async def _approval(self, client: Any, ctx: _Ctx, run: _Run, data: dict, emit, call) -> AsyncIterator[Any]:
+        rid = data.get("request_id") or data.get("prompt_id")
+        answer = {"request_id": rid} if isinstance(rid, str) and rid else {}
+        if isinstance(data.get("execution_generation"), int):
+            answer["execution_generation"] = data["execution_generation"]
+        offered = offered_choices(data.get("choices"), ctx.allowed_choices)
+        if "deny" not in offered:
+            offered.append("deny")
+        command, description = str(data.get("command") or ""), str(data.get("description") or "")
+        fence = "`" * max(3, max((len(m) for m in re.findall(r"`+", command)), default=0) + 1)
+        message = f"{description}\n\n{fence}\n{command}\n{fence}".strip()
+        reason = ""
+        if ctx.approval_mode == "deny" or offered == ["deny"]:
+            choice, reason = "deny", "automatisch"
+        elif ctx.approval_mode == "auto":
+            choice, reason = auto_choice(offered, ctx.auto_choice), "automatisch"
+        elif call is None:
+            run.parked = True
+            self._pending[ctx.key] = {"run_id": run.run_id, "last_id": run.last_id, "streamed": run.streamed,
+                                      "answer": answer, "offered": offered}
+            await self._status(emit, "Wartet auf Freigabe", done=True)
+            yield f"\n\n**{APPROVAL_TITLE}**\n\n{message}\n\n{self._approve_hint(offered)}"
+            return
+        else:
+            await self._status(emit, "Wartet auf Freigabe")
+            if set(offered) <= {"once", "deny"}:
+                result, reason = await self._ask(call, {"type": "confirmation", "data": {
+                    "title": APPROVAL_TITLE, "message": message}})
+                choice = "once" if result is True else "deny"
+            else:
+                result, reason = await self._ask(call, {"type": "input", "data": {
+                    "title": APPROVAL_TITLE, "message": f"{message}\n\nAntwort: {_or_list(offered)}",
+                    "placeholder": "once", "value": "once"}})
+                raw = str(result or "").strip().lower()
+                choice = CHOICE_ALIASES.get(raw, raw)
+                if result is not None and choice not in offered:
+                    reason = f"ungültige Eingabe `{raw[:40]}`"
+                if choice not in offered:
+                    choice = "deny"
+        _, err = await self._send(client, ctx, run, "approval", {**answer, "choice": choice})
+        run.sent_choice = choice
+        yield self._approval_line(choice, reason, err)
+        await self._status(emit, "Hermes arbeitet")
+
+    async def _clarify(self, client: Any, ctx: _Ctx, run: _Run, data: dict, call) -> AsyncIterator[Any]:
+        rid = data.get("request_id") or data.get("prompt_id")
+        answer = {"request_id": rid} if isinstance(rid, str) and rid else {}
+        if isinstance(data.get("execution_generation"), int):
+            answer["execution_generation"] = data["execution_generation"]
+        choices = [str(c) for c in data.get("choices") or [] if isinstance(c, (str, int, float))]
+        question = str(data.get("question") or data.get("prompt") or "Hermes hat eine Rückfrage.")
+        message = f"{question}\n\nOptionen: {', '.join(choices)}" if choices else question
+        if call is None:
+            yield f"\n\n**Rückfrage von Hermes:** {message}\n\n*(Ohne Dialog keine Antwort möglich.)*\n\n"
+            return
+        result, reason = await self._ask(call, {"type": "input", "data": {
+            "title": "Rückfrage von Hermes", "message": message, "placeholder": choices[0] if choices else ""}})
+        text = result.strip() if isinstance(result, str) else ""
+        if not text:
+            yield f"\n\n*(Rückfrage nicht beantwortet: {reason or 'leere Antwort'})*\n\n"
+            return
+        _, err = await self._send(client, ctx, run, "clarify", {**answer, "answer": text})
+        yield f"\n\n*(Antwort an Hermes nicht gesendet: {err})*\n\n" if err else f"\n\n*(Antwort an Hermes: {text[:200]})*\n\n"

@@ -14,7 +14,7 @@ Ausführliche Analysen und Entscheidungen befinden sich im Ordner [`docs/`](docs
 |---|---|---|---|
 | `skills/openwebui-visuals` | Hermes Skill | **in Arbeit** | Formatanweisungen für Hermes (Mermaid, SVG, HTML-Artifacts, `MEDIA:`-Fallback) |
 | `functions/hermes_embeds_filter.py` | Open WebUI Filter | **fertig (ungetestet live)** | Wandelt ```viz-html Blöcke in native Open-WebUI `embeds` (Iframe mit Chart.js / Dashboards) |
-| `functions/hermes_runs_pipe.py` | Open WebUI Pipe | **Spezifikation fertig (`docs/spec/hermes-runs-pipe.md`), Code folgt in Teil 3b** | Anbindung von `/v1/runs`, Freigaben und Session-Mapping (ADR [0002](docs/decisions/0002-runs-pipe.md)) |
+| `functions/hermes_runs_pipe.py` | Open WebUI Pipe (Manifold) | **fertig (ungetestet live)** | Anbindung von `/v1/runs`, Freigaben und Session-Header (ADR [0002](docs/decisions/0002-runs-pipe.md), Spezifikation [`docs/spec/hermes-runs-pipe.md`](docs/spec/hermes-runs-pipe.md)) |
 | `router/` / Router-Integration | AIOHTTP Relay | **beobachtet** | Pufferung von SSE-Frames, Reasoning-Konvertierung, geplantes MEDIA-Inlining |
 
 ## Installation & Hinweise
