@@ -103,14 +103,14 @@ class TestHermesEmbedsFilter(unittest.TestCase):
         self.assertEqual(emitted[0]["type"], "embeds")
         self.assertEqual(len(emitted[0]["data"]["embeds"]), 1)
         self.assertTrue(emitted[0]["data"]["replace"])
-        self.assertIn("*(Diagramm oben eingebettet)*", res_body["messages"][-1]["content"])
+        self.assertIn("*(chart embedded above)*", res_body["messages"][-1]["content"])
 
     def test_outlet_idempotent(self):
         f = filter_mod.Filter()
         body = {
             "model": "hermes-agent",
             "messages": [
-                {"role": "assistant", "content": "Already embedded: *(Diagramm oben eingebettet)*"}
+                {"role": "assistant", "content": "Already embedded: *(chart embedded above)*"}
             ]
         }
         emitted = []
@@ -122,7 +122,7 @@ class TestHermesEmbedsFilter(unittest.TestCase):
 
         res_body = asyncio.run(run())
         self.assertEqual(len(emitted), 0)
-        self.assertEqual(res_body["messages"][-1]["content"], "Already embedded: *(Diagramm oben eingebettet)*")
+        self.assertEqual(res_body["messages"][-1]["content"], "Already embedded: *(chart embedded above)*")
 
     def test_outlet_task_metadata(self):
         f = filter_mod.Filter()

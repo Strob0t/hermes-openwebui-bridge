@@ -1,9 +1,9 @@
-# ADR 0001: Open-WebUI-Filter statt Pipe für visuelle Embeds
+# ADR 0001: Open WebUI Filter instead of Pipe for Visual Embeds
 
-- **Status:** Akzeptiert (2026-11-09)
-- **Kontext:** Für interaktive HTML/Chart.js-Visualisierungen aus Hermes-Antworten musste gewählt werden, ob Open WebUI über eine Pipe oder einen Filter angebunden wird.
-- **Entscheidung:** Es wird ein Open-WebUI **Filter** (`hermes_embeds_filter.py`) statt einer Pipe verwendet.
-- **Begründung:**
-  1. Die bestehende Verbindung über den Router `hermes-models` (inklusive SSE-Streaming und `hermes_reasoning_filter.py`) bleibt vollständig erhalten.
-  2. Ein Filter greift im `outlet`-Hook auf die fertige Nachricht zu und emittiert `embeds`-Events per `__event_emitter__`, während nicht unterstützte Clients oder Fehlersituationen durch den ```viz-html Codeblock ein automatisches Artifact-Fallback bieten (fail-open).
-- **Konsequenzen:** Keine Änderung am Upstream-Modellrouting; nahtlose Integration neben den bestehenden Filtern.
+- **Status:** Accepted (2026-11-09)
+- **Context:** For interactive HTML/Chart.js visualizations from Hermes responses, it was necessary to choose whether Open WebUI is connected via a pipe or a filter.
+- **Decision:** An Open WebUI **filter** (`hermes_embeds_filter.py`) is used instead of a pipe.
+- **Rationale:**
+  1. The existing connection via the `hermes-models` router (including SSE streaming and `hermes_reasoning_filter.py`) is fully preserved.
+  2. A filter accesses the completed message in the `outlet` hook and emits `embeds` events via `__event_emitter__`, while unsupported clients or error situations provide an automatic artifact fallback through the ```viz-html code block (fail-open).
+- **Consequences:** No change to upstream model routing; seamless integration alongside existing filters.

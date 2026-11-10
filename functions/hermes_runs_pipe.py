@@ -1,7 +1,7 @@
 """
 title: Hermes Runs Pipe
 author: Strob0t
-version: 0.2.0
+version: 0.3.0
 license: AGPL-3.0
 description: Runs Open WebUI chats as Hermes runs over /v1/runs, with model discovery, tool progress, approval dialogs and one Hermes session per chat.
 required_open_webui_version: 0.12.0
@@ -38,21 +38,120 @@ except ImportError:
         return default
 
 log = logging.getLogger(__name__)
+LOG_PREFIX = "hermes runs pipe"
 
-DEFAULT_MODEL = {"id": "hermes-default", "name": "Hermes (Gateway-Default)", "default": True}
+# Open WebUI loads a function from one file, so this module keeps all parts. Sections, top to bottom:
+# constants and UI texts, pure helpers (policies, models, SSE, text), request context, the Pipe class.
+
+# --- Protocol constants -------------------------------------------------------------------------
+DEFAULT_MODEL_ID = "hermes-default"
 POLICY_KEYS = ("approval_mode", "allowed_approval_choices", "auto_choice", "allowed_roles")
 APPROVAL_CHOICES = ("once", "session", "always", "deny")
 APPROVAL_MODES = ("ask", "auto", "deny")
-CHOICE_ALIASES = {"approve": "once", "approved": "once", "allow": "once"}
+DEFAULT_EVENT_CHOICES = ["once", "deny"]
+CHOICE_DENY = "deny"
+CHOICE_ONCE = "once"
+CHOICE_ALIASES = {"approve": CHOICE_ONCE, "approved": CHOICE_ONCE, "allow": CHOICE_ONCE}
 SLASH_COMMANDS = ("reset", "approve", "deny")
 TERMINAL_STATUSES = ("completed", "failed", "cancelled", "interrupted")
+RUN_END_EVENTS = ("run.failed", "run.cancelled", "run.interrupted")
+FATAL_STREAM_STATUSES = (401, 403, 404)
 MAX_RECONNECTS = 3
 NETWORK_ERRORS: tuple = (OSError, asyncio.TimeoutError) + ((aiohttp.ClientError,) if aiohttp else ())
-APPROVAL_TITLE = "Hermes braucht eine Freigabe"
-TEXT_DENIED = "Dieses Modell ist für dein Konto nicht freigegeben"
-TEXT_RESET = "Session zurückgesetzt"
-TEXT_NO_PENDING = "Keine offene Freigabe in diesem Chat."
-TEXT_NO_INPUT = "Keine Nutzernachricht gefunden."
+
+HEADER_SESSION_KEY = "X-Hermes-Session-Key"
+HEADER_USER_ROLE = "X-Hermes-User-Role"
+HEADER_USER_NAME = "X-Hermes-User-Name"
+HEADER_SESSION_ID = "X-Hermes-Session-Id"
+HEADER_IDEMPOTENCY = "Idempotency-Key"
+HEADER_LAST_EVENT_ID = "Last-Event-ID"
+SESSION_KEY_PREFIX = "owui"
+IDEMPOTENCY_KEY_LIMIT = 255
+
+# --- Display limits (characters) ----------------------------------------------------------------
+ERROR_TEXT_LIMIT = 300
+STATUS_LINE_LIMIT = 120
+ROUTE_STATUS_LIMIT = 100
+INVALID_INPUT_PREVIEW = 40
+ANSWER_PREVIEW = 200
+
+# --- UI texts -----------------------------------------------------------------------------------
+# Every text that a user sees. The valve TEXTS (JSON object with the same keys) overrides single
+# entries, for example for a German UI. Placeholders in {braces} are filled with str.format().
+TEXTS = {
+    "default_model_name": "Hermes (gateway default)",
+    "approval_title": "Hermes needs an approval",
+    "denied": "This model is not enabled for your account",
+    "reset": "Session reset",
+    "no_pending": "No open approval in this chat.",
+    "no_input": "No user message found.",
+    "unreachable": "Hermes is not reachable ({base})",
+    "unreachable_detail": "Hermes is not reachable ({base}): {error}",
+    "run_rejected": "Hermes rejected the run (HTTP {status}: {detail})",
+    "no_run_id": "no run_id",
+    "pipe_error": "\n\nError in the Hermes runs pipe: {error}",
+    "working": "Hermes is working",
+    "route": "Route: {route}",
+    "invalid_choice": "Invalid choice `{choice}`. {hint}",
+    "approve_hint": "Answer with `/approve [{choices}]` or `/deny`.",
+    "deny_hint": "Answer with `/deny`.",
+    "approval_sent": "\n\n*(Approval: {choice}{reason})*\n\n",
+    "approval_not_sent": "\n\n*(Approval `{choice}` not sent: {error})*\n\n",
+    "reason_separator": ", ",
+    "waiting_approval": "Waiting for approval",
+    "approval_answer": "{message}\n\nAnswer: {choices}",
+    "invalid_input": "invalid input `{raw}`",
+    "automatic": "automatic",
+    "dialog_timeout": "timed out",
+    "dialog_failed": "dialog failed",
+    "dialog_no_answer": "dialog without answer",
+    "idle_status": "Hermes does not respond",
+    "idle_text": "\n\nNo data from Hermes for {seconds} s, run stopped.",
+    "lost_status": "Lost the connection to the progress",
+    "lost_text": "\n\nLost the connection to the progress (run `{run_id}`, status {state}). "
+                 "The run may continue in Hermes.",
+    "run_ended": "\n\nRun {state}: {error}",
+    "no_error_text": "no error text",
+    "unknown": "unknown",
+    "tool_started": "{tool}: {preview}",
+    "tool_done": "{tool} done ({duration} s{error})",
+    "tool_error_suffix": ", error",
+    "tool_fallback_name": "tool",
+    "subagent_start": "Subagent started",
+    "subagent_done": "Subagent done",
+    "replay_truncated": "\n\n*(Parts of the progress are missing)*\n\n",
+    "done": "Done",
+    "run.failed": "Run failed",
+    "run.cancelled": "Run cancelled",
+    "run.interrupted": "Run interrupted",
+    "run_end_with_error": "\n\n{label}: {error}",
+    "run_end_plain": "\n\n{label}.",
+    "clarify_title": "Question from Hermes",
+    "clarify_default": "Hermes has a question.",
+    "clarify_options": "{question}\n\nOptions: {choices}",
+    "clarify_no_dialog": "\n\n**Question from Hermes:** {message}\n\n*(No answer possible without a dialog.)*\n\n",
+    "clarify_unanswered": "\n\n*(Question not answered: {reason})*\n\n",
+    "empty_answer": "empty answer",
+    "clarify_not_sent": "\n\n*(Answer to Hermes not sent: {error})*\n\n",
+    "clarify_sent": "\n\n*(Answer to Hermes: {answer})*\n\n",
+    "or": " or ",
+}
+DEFAULT_MODEL = {"id": DEFAULT_MODEL_ID, "name": TEXTS["default_model_name"], "default": True}
+
+
+def parse_texts(raw: Any) -> dict:
+    """Parses the TEXTS valve: JSON object of text overrides. Unknown keys and non-string values are dropped.
+    Returns the merged texts; on invalid JSON the defaults with a warning.
+    """
+    try:
+        data = json.loads(raw) if isinstance(raw, str) and raw.strip() else (raw or {})
+    except ValueError as e:
+        log.warning("%s: TEXTS is not valid JSON, using the defaults: %s", LOG_PREFIX, e)
+        return dict(TEXTS)
+    if not isinstance(data, dict):
+        log.warning("%s: TEXTS is not a JSON object, using the defaults", LOG_PREFIX)
+        return dict(TEXTS)
+    return {**TEXTS, **{k: v for k, v in data.items() if k in TEXTS and isinstance(v, str)}}
 
 
 def _csv(value: Any) -> list[str]:
@@ -74,10 +173,10 @@ def parse_policies(raw: Any) -> list[dict]:
     try:
         data = json.loads(raw) if isinstance(raw, str) and raw.strip() else (raw or [])
     except ValueError as e:
-        log.warning("hermes runs pipe: MODEL_POLICIES is not valid JSON, using none: %s", e)
+        log.warning("%s: MODEL_POLICIES is not valid JSON, using none: %s", LOG_PREFIX, e)
         return []
     if not isinstance(data, list):
-        log.warning("hermes runs pipe: MODEL_POLICIES is not a JSON list, using none")
+        log.warning("%s: MODEL_POLICIES is not a JSON list, using none", LOG_PREFIX)
         return []
     policies = []
     for entry in data:
@@ -86,7 +185,7 @@ def parse_policies(raw: Any) -> list[dict]:
         try:
             pattern = re.compile(entry["match"])
         except re.error as e:
-            log.warning("hermes runs pipe: MODEL_POLICIES regex %r invalid: %s", entry["match"], e)
+            log.warning("%s: MODEL_POLICIES regex %r invalid: %s", LOG_PREFIX, entry["match"], e)
             continue
         policies.append({"match": pattern, **{k: entry[k] for k in POLICY_KEYS if entry.get(k)}})
     return policies
@@ -112,7 +211,7 @@ def parse_model_list(data: Any, id_filter: str = "", owned_by_csv: str = "") -> 
         try:
             pattern = re.compile(id_filter.strip())
         except re.error as e:
-            log.warning("hermes runs pipe: MODEL_FILTER regex invalid, ignoring it: %s", e)
+            log.warning("%s: MODEL_FILTER regex invalid, ignoring it: %s", LOG_PREFIX, e)
     owners = _csv(owned_by_csv)
     models = []
     for item in items:
@@ -133,22 +232,23 @@ def parse_model_list(data: Any, id_filter: str = "", owned_by_csv: str = "") -> 
 
 def session_key(user_id: str, chat_id: str, reset_count: int = 0) -> str:
     """Returns the X-Hermes-Session-Key value owui:<user_id>:<chat_id>, with :r<n> after a /reset."""
-    key = f"owui:{user_id}:{chat_id}"
+    key = f"{SESSION_KEY_PREFIX}:{user_id}:{chat_id}"
     return f"{key}:r{reset_count}" if reset_count else key
 
 
 def idempotency_key(chat_id: str, message_id: str) -> str:
-    """Returns owui:<chat_id>:<message_id> with only visible ASCII characters, at most 255.
+    """Returns owui:<chat_id>:<message_id> with only visible ASCII characters, at most IDEMPOTENCY_KEY_LIMIT.
     Returns "" if an id is missing; then the pipe sends no Idempotency-Key header.
     """
     if not chat_id or not message_id:
         return ""
-    return "".join(c for c in f"owui:{chat_id}:{message_id}" if "!" <= c <= "~")[:255]
+    raw = f"{SESSION_KEY_PREFIX}:{chat_id}:{message_id}"
+    return "".join(c for c in raw if "!" <= c <= "~")[:IDEMPOTENCY_KEY_LIMIT]
 
 
 def _event_choices(event_choices: Any) -> list[str]:
     if not isinstance(event_choices, (list, tuple)) or not event_choices:
-        return ["once", "deny"]
+        return list(DEFAULT_EVENT_CHOICES)
     return [str(c).strip().lower() for c in event_choices]
 
 
@@ -164,8 +264,8 @@ def auto_choice(event_choices: Any, wanted: str) -> str:
     wanted = str(wanted or "").strip().lower()
     if wanted in choices:
         return wanted
-    if "once" in choices:
-        return "once"
+    if CHOICE_ONCE in choices:
+        return CHOICE_ONCE
     return choices[0]
 
 
@@ -257,7 +357,7 @@ def _header_text(value: Any) -> str:
     return quote(str(value or "").strip(), safe=string.punctuation + " ")
 
 
-def _error_text(data: Any, limit: int = 300) -> str:
+def _error_text(data: Any, limit: int = ERROR_TEXT_LIMIT) -> str:
     """Returns the error message of a Hermes/OpenAI error body, shortened."""
     if isinstance(data, dict):
         err = data.get("error")
@@ -265,9 +365,9 @@ def _error_text(data: Any, limit: int = 300) -> str:
     return re.sub(r"\s+", " ", str(data or "")).strip()[:limit]
 
 
-def _or_list(items: list[str]) -> str:
-    """Returns "a, b oder c"."""
-    return items[0] if len(items) == 1 else ", ".join(items[:-1]) + " oder " + items[-1]
+def _or_list(items: list[str], or_word: str = TEXTS["or"]) -> str:
+    """Returns "a, b or c" (or_word carries the spaces)."""
+    return items[0] if len(items) == 1 else ", ".join(items[:-1]) + or_word + items[-1]
 
 
 class _IdleTimeout(Exception):
@@ -319,7 +419,7 @@ class _Ctx:
         policy = policy_for(self.short_model, pipe.policies())
         mode = str(policy.get("approval_mode") or v.APPROVAL_MODE or "").strip().lower()
         if mode not in APPROVAL_MODES:
-            log.warning("hermes runs pipe: unknown approval mode %r, using ask", mode)
+            log.warning("%s: unknown approval mode %r, using ask", LOG_PREFIX, mode)
             mode = "ask"
         self.approval_mode = mode
         self.allowed_choices = policy.get("allowed_approval_choices") or v.ALLOWED_APPROVAL_CHOICES
@@ -340,11 +440,11 @@ class _Ctx:
         if pipe.valves.HERMES_API_KEY:
             h["Authorization"] = f"Bearer {pipe.valves.HERMES_API_KEY}"
         if self.chat_id:
-            h["X-Hermes-Session-Key"] = session_key(self.user_id, self.chat_id, pipe._resets.get(self.key, 0))
+            h[HEADER_SESSION_KEY] = session_key(self.user_id, self.chat_id, pipe._resets.get(self.key, 0))
         if self.role:
-            h["X-Hermes-User-Role"] = _header_text(self.role)
+            h[HEADER_USER_ROLE] = _header_text(self.role)
         if self.name:
-            h["X-Hermes-User-Name"] = _header_text(self.name)
+            h[HEADER_USER_NAME] = _header_text(self.name)
         h.update({k: val for k, val in extra.items() if val})
         return h
 
@@ -427,6 +527,10 @@ class Pipe:
             default="admin",
             description="Comma-separated Open WebUI roles that can use the pipe; * = all",
         )
+        TEXTS: str = Field(
+            default="{}",
+            description='JSON object that overrides UI texts by key (see TEXTS in the code), e.g. {"working": "Hermes arbeitet"}',
+        )
         DEBUG: bool = Field(
             default=False,
             description="Enable debug logging",
@@ -451,6 +555,15 @@ class Pipe:
 
     def policies(self) -> list[dict]:
         return parse_policies(self.valves.MODEL_POLICIES)
+
+    def _t(self, key: str, **values: Any) -> str:
+        """Returns the UI text for key (valve TEXTS over the defaults) with the placeholders filled."""
+        text = parse_texts(self.valves.TEXTS).get(key, TEXTS[key])
+        try:
+            return text.format(**values)
+        except (KeyError, IndexError, ValueError) as e:
+            log.warning("%s: TEXTS entry %r has a bad placeholder (%s), using the default", LOG_PREFIX, key, e)
+            return TEXTS[key].format(**values)
 
     @staticmethod
     def short_model_id(model: str) -> str:
@@ -487,11 +600,11 @@ class Pipe:
                 try:
                     models = await self._fetch_models()
                 except Exception as e:
-                    log.warning("hermes runs pipe: model discovery failed (%s), %s", e,
+                    log.warning("%s: model discovery failed (%s), %s", LOG_PREFIX, e,
                                 "keeping the last list" if self._models else "using the default entry")
                 else:
                     if not models:
-                        log.warning("hermes runs pipe: model discovery returned no model after the filters")
+                        log.warning("%s: model discovery returned no model after the filters", LOG_PREFIX)
                     self._models, self._models_at = models, now
             return [dict(m) for m in self._models] or [dict(DEFAULT_MODEL)]
 
@@ -541,7 +654,7 @@ class Pipe:
         try:
             status, data, _ = await self._request(client, "post", ctx, f"/runs/{run.run_id}/{kind}", payload)
         except NETWORK_ERRORS as e:
-            return 0, f"Hermes ist nicht erreichbar ({ctx.base}): {type(e).__name__}"
+            return 0, self._t("unreachable_detail", base=ctx.base, error=type(e).__name__)
         if status >= 300:
             return status, f"HTTP {status}: {_error_text(data)}".rstrip(": ")
         return status, ""
@@ -550,7 +663,7 @@ class Pipe:
         try:
             await self._request(client, "post", ctx, f"/runs/{run.run_id}/stop", {})
         except Exception as e:
-            log.warning("hermes runs pipe: stop of run %s failed: %s", run.run_id, e)
+            log.warning("%s: stop of run %s failed: %s", LOG_PREFIX, run.run_id, e)
 
     @staticmethod
     async def _status(emit: Optional[Callable], description: str, done: bool = False) -> None:
@@ -559,7 +672,7 @@ class Pipe:
         try:
             await emit({"type": "status", "data": {"description": description, "done": done}})
         except Exception as e:
-            log.debug("hermes runs pipe: status event failed: %s", e)
+            log.debug("%s: status event failed: %s", LOG_PREFIX, e)
 
     @staticmethod
     def _chunk(ctx: _Ctx, field: str, text: str) -> dict:
@@ -594,20 +707,20 @@ class Pipe:
                 yield ""
                 return
             if not role_allowed(ctx.role, ctx.allowed_roles):
-                yield TEXT_DENIED
+                yield self._t("denied")
                 return
             text = last_user_text(body.get("messages"))
             slash = parse_slash(text)
             if slash and slash[0] == "reset":
                 self._resets[ctx.key] = self._resets.get(ctx.key, 0) + 1
                 self._pending.pop(ctx.key, None)
-                yield TEXT_RESET
+                yield self._t("reset")
                 return
             if slash and ctx.key not in self._pending:
-                yield TEXT_NO_PENDING
+                yield self._t("no_pending")
                 return
             if not slash and not text.strip():
-                yield TEXT_NO_INPUT
+                yield self._t("no_input")
                 return
             async with self._client_factory() as client:
                 if slash:
@@ -623,30 +736,30 @@ class Pipe:
         except (GeneratorExit, asyncio.CancelledError):
             raise
         except Exception as e:
-            log.exception("hermes runs pipe failed")
-            yield f"\n\nFehler in der Hermes-Runs-Pipe: {type(e).__name__}: {e}"
+            log.exception("%s failed", LOG_PREFIX)
+            yield self._t("pipe_error", error=f"{type(e).__name__}: {e}")
 
     async def _start(self, client: Any, ctx: _Ctx, text: str, emit, call) -> AsyncIterator[Any]:
         """Starts a run with the last user message and follows it."""
         try:
             status, data, headers = await self._request(
                 client, "post", ctx, "/runs", ctx.run_body(text),
-                **{"Idempotency-Key": idempotency_key(ctx.chat_id, ctx.message_id)})
+                **{HEADER_IDEMPOTENCY: idempotency_key(ctx.chat_id, ctx.message_id)})
         except NETWORK_ERRORS as e:
-            log.warning("hermes runs pipe: POST /runs failed: %s", e)
-            yield f"Hermes ist nicht erreichbar ({ctx.base})"
+            log.warning("%s: POST /runs failed: %s", LOG_PREFIX, e)
+            yield self._t("unreachable", base=ctx.base)
             return
         run_id = data.get("run_id") if isinstance(data, dict) else None
         if status >= 300 or not isinstance(run_id, str) or not run_id:
-            yield f"Hermes hat den Run abgelehnt (HTTP {status}: {_error_text(data) or 'keine run_id'})"
+            yield self._t("run_rejected", status=status, detail=_error_text(data) or self._t("no_run_id"))
             return
         if self.valves.DEBUG:
-            log.debug("hermes runs pipe: run %s, session %s", run_id, headers.get("X-Hermes-Session-Id"))
+            log.debug("%s: run %s, session %s", LOG_PREFIX, run_id, headers.get(HEADER_SESSION_ID))
         route_header = str(self.valves.ROUTE_HEADER or "").strip()
         route = headers.get(route_header) if route_header else None
         if isinstance(route, str) and route.strip():
-            await self._status(emit, f"Route: {route.strip()[:100]}")
-        await self._status(emit, "Hermes arbeitet")
+            await self._status(emit, self._t("route", route=route.strip()[:ROUTE_STATUS_LIMIT]))
+        await self._status(emit, self._t("working"))
         async with aclosing(self._follow(client, ctx, _Run(run_id), emit, call)) as chunks:
             async for chunk in chunks:
                 yield chunk
@@ -655,9 +768,12 @@ class Pipe:
         """Sends /approve or /deny for the open approval of this chat and follows the run again."""
         pending = self._pending[ctx.key]
         command, arg = slash
-        choice = "deny" if command == "deny" else CHOICE_ALIASES.get(arg.lower(), arg.lower()) or "once"
-        if choice != "deny" and choice not in pending["offered"]:
-            yield f"Ungültige Wahl `{arg}`. {self._approve_hint(pending['offered'])}"
+        if command == CHOICE_DENY:
+            choice = CHOICE_DENY
+        else:
+            choice = CHOICE_ALIASES.get(arg.lower(), arg.lower()) or CHOICE_ONCE
+        if choice != CHOICE_DENY and choice not in pending["offered"]:
+            yield self._t("invalid_choice", choice=arg, hint=self._approve_hint(pending["offered"]))
             return
         del self._pending[ctx.key]
         run = _Run(pending["run_id"], pending["last_id"], pending["streamed"])
@@ -669,7 +785,7 @@ class Pipe:
                 # The answer did not reach Hermes: keep the approval open for a new try.
                 self._pending[ctx.key] = pending
             return
-        await self._status(emit, "Hermes arbeitet")
+        await self._status(emit, self._t("working"))
         async with aclosing(self._follow(client, ctx, run, emit, call)) as chunks:
             async for chunk in chunks:
                 yield chunk
@@ -695,8 +811,8 @@ class Pipe:
             idle = False
         if idle:
             await self._stop(client, ctx, run)
-            await self._status(emit, "Hermes antwortet nicht", done=True)
-            yield f"\n\nKeine Daten von Hermes seit {self.valves.STREAM_IDLE_TIMEOUT} s, Run gestoppt."
+            await self._status(emit, self._t("idle_status"), done=True)
+            yield self._t("idle_text", seconds=self.valves.STREAM_IDLE_TIMEOUT)
 
     async def _events(self, client: Any, ctx: _Ctx, run: _Run, emit, call) -> AsyncIterator[Any]:
         """Reads the event stream; reconnects up to MAX_RECONNECTS times, then reads the run status."""
@@ -706,10 +822,10 @@ class Pipe:
                     async for chunk in chunks:
                         yield chunk
             except NETWORK_ERRORS as e:
-                log.warning("hermes runs pipe: event stream of run %s broke: %s", run.run_id, e)
+                log.warning("%s: event stream of run %s broke: %s", LOG_PREFIX, run.run_id, e)
             except _HttpError as e:
-                log.warning("hermes runs pipe: event stream of run %s: %s", run.run_id, e)
-                if e.status in (401, 403, 404):
+                log.warning("%s: event stream of run %s: %s", LOG_PREFIX, run.run_id, e)
+                if e.status in FATAL_STREAM_STATUSES:
                     break
             if run.done or run.parked:
                 return
@@ -721,7 +837,7 @@ class Pipe:
     async def _stream_once(self, client: Any, ctx: _Ctx, run: _Run, emit, call) -> AsyncIterator[Any]:
         headers = {"Accept": "text/event-stream"}
         if run.last_id is not None:
-            headers["Last-Event-ID"] = run.last_id
+            headers[HEADER_LAST_EVENT_ID] = run.last_id
         url = f"{ctx.base}/runs/{run.run_id}/events"
         async with client.get(url, headers=ctx.headers(self, **headers), timeout=self._timeout(0)) as resp:
             if resp.status != 200:
@@ -743,23 +859,22 @@ class Pipe:
         try:
             status, data, _ = await self._request(client, "get", ctx, f"/runs/{run.run_id}")
         except NETWORK_ERRORS as e:
-            log.warning("hermes runs pipe: GET run %s failed: %s", run.run_id, e)
+            log.warning("%s: GET run %s failed: %s", LOG_PREFIX, run.run_id, e)
             status, data = 0, {}
         state = data.get("status") if isinstance(data, dict) else None
-        await self._status(emit, "Verbindung zum Fortschritt verloren", done=True)
+        await self._status(emit, self._t("lost_status"), done=True)
         if status == 200 and state == "completed":
             yield remaining_output(data.get("output"), run.streamed)
         elif status == 200 and state in TERMINAL_STATUSES:
-            yield f"\n\nRun {state}: {_error_text(data.get('error')) or 'ohne Fehlertext'}"
+            yield self._t("run_ended", state=state, error=_error_text(data.get("error")) or self._t("no_error_text"))
         else:
-            yield (f"\n\nVerbindung zum Fortschritt verloren (Run `{run.run_id}`, Status "
-                   f"{state or status or 'unbekannt'}). Der Run läuft in Hermes eventuell weiter.")
+            yield self._t("lost_text", run_id=run.run_id, state=state or status or self._t("unknown"))
 
     async def _on_event(self, client: Any, ctx: _Ctx, run: _Run, data: dict, emit, call) -> AsyncIterator[Any]:
         name = str(data.get("event") or "")
         show = self.valves.SHOW_TOOL_PROGRESS
         if name in ("run.queued", "run.running"):
-            await self._status(emit, "Hermes arbeitet")
+            await self._status(emit, self._t("working"))
         elif name == "message.delta":
             delta = data.get("delta")
             if isinstance(delta, str) and delta:
@@ -773,14 +888,17 @@ class Pipe:
                 run.streamed += text
                 yield text
         elif name == "tool.started" and show:
-            line = f"{data.get('tool') or 'tool'}: {data.get('preview') or ''}".rstrip(": ")
-            await self._status(emit, line[:120])
+            tool = data.get("tool") or self._t("tool_fallback_name")
+            line = self._t("tool_started", tool=tool, preview=data.get("preview") or "").rstrip(": ")
+            await self._status(emit, line[:STATUS_LINE_LIMIT])
             chunk = self._reasoning(ctx, f"> {line}\n")
             if chunk:
                 yield chunk
         elif name == "tool.completed" and show:
-            line = f"{data.get('tool') or 'tool'} fertig ({data.get('duration') or 0} s{', Fehler' if data.get('error') else ''})"
-            await self._status(emit, line[:120])
+            tool = data.get("tool") or self._t("tool_fallback_name")
+            error = self._t("tool_error_suffix") if data.get("error") else ""
+            line = self._t("tool_done", tool=tool, duration=data.get("duration") or 0, error=error)
+            await self._status(emit, line[:STATUS_LINE_LIMIT])
             chunk = self._reasoning(ctx, f"> {line}\n")
             if chunk:
                 yield chunk
@@ -790,8 +908,8 @@ class Pipe:
             if chunk:
                 yield chunk
         elif name in ("subagent.start", "subagent.complete") and show:
-            label = "Subagent startet" if name == "subagent.start" else "Subagent fertig"
-            await self._status(emit, f"{label}: {data.get('preview') or ''}".rstrip(": ")[:120])
+            label = self._t("subagent_start" if name == "subagent.start" else "subagent_done")
+            await self._status(emit, f"{label}: {data.get('preview') or ''}".rstrip(": ")[:STATUS_LINE_LIMIT])
         elif name == "approval.request":
             async with aclosing(self._approval(client, ctx, run, data, emit, call)) as chunks:
                 async for chunk in chunks:
@@ -801,51 +919,48 @@ class Pipe:
             if choice and choice == run.sent_choice:
                 run.sent_choice = ""
             elif choice:
-                yield f"\n\n*(Freigabe: {choice})*\n\n"
+                yield self._t("approval_sent", choice=choice, reason="")
         elif name == "clarify.request":
             async with aclosing(self._clarify(client, ctx, run, data, call)) as chunks:
                 async for chunk in chunks:
                     yield chunk
         elif name == "replay.truncated":
-            yield "\n\n*(Teile des Fortschritts fehlen)*\n\n"
+            yield self._t("replay_truncated")
         elif name == "run.completed":
             run.done = True
-            await self._status(emit, "Fertig", done=True)
+            await self._status(emit, self._t("done"), done=True)
             rest = remaining_output(data.get("output"), run.streamed)
             if rest:
                 yield rest
-        elif name in ("run.failed", "run.cancelled", "run.interrupted"):
+        elif name in RUN_END_EVENTS:
             run.done = True
-            label = {"run.failed": "Run fehlgeschlagen", "run.cancelled": "Run abgebrochen",
-                     "run.interrupted": "Run unterbrochen"}[name]
+            label = self._t(name)
             await self._status(emit, label, done=True)
             error = _error_text(data.get("error"))
-            yield f"\n\n{label}: {error}" if error else f"\n\n{label}."
+            yield self._t("run_end_with_error", label=label, error=error) if error else self._t("run_end_plain", label=label)
         elif self.valves.DEBUG:
-            log.debug("hermes runs pipe: event %s ignored", name)
+            log.debug("%s: event %s ignored", LOG_PREFIX, name)
 
-    @staticmethod
-    def _approve_hint(offered: list[str]) -> str:
-        approve = [c for c in offered if c != "deny"]
-        return f"Antworte mit `/approve [{'|'.join(approve)}]` oder `/deny`." if approve else "Antworte mit `/deny`."
+    def _approve_hint(self, offered: list[str]) -> str:
+        approve = [c for c in offered if c != CHOICE_DENY]
+        return self._t("approve_hint", choices="|".join(approve)) if approve else self._t("deny_hint")
 
-    @staticmethod
-    def _approval_line(choice: str, reason: str, err: str) -> str:
+    def _approval_line(self, choice: str, reason: str, err: str) -> str:
         if err:
-            return f"\n\n*(Freigabe `{choice}` nicht gesendet: {err})*\n\n"
-        return f"\n\n*(Freigabe: {choice}{', ' + reason if reason else ''})*\n\n"
+            return self._t("approval_not_sent", choice=choice, error=err)
+        return self._t("approval_sent", choice=choice, reason=self._t("reason_separator") + reason if reason else "")
 
     async def _ask(self, call, event: dict) -> tuple[Any, str]:
         """Runs one __event_call__ dialog. Returns (result, "") or (None, reason)."""
         try:
             result = await asyncio.wait_for(call(event), self.valves.APPROVAL_TIMEOUT)
         except asyncio.TimeoutError:
-            return None, "Zeit abgelaufen"
+            return None, self._t("dialog_timeout")
         except Exception as e:
-            log.warning("hermes runs pipe: dialog failed: %s", e)
-            return None, "Dialog fehlgeschlagen"
+            log.warning("%s: dialog failed: %s", LOG_PREFIX, e)
+            return None, self._t("dialog_failed")
         if isinstance(result, dict) and result.get("error"):
-            return None, "Dialog ohne Antwort"
+            return None, self._t("dialog_no_answer")
         return result, ""
 
     async def _approval(self, client: Any, ctx: _Ctx, run: _Run, data: dict, emit, call) -> AsyncIterator[Any]:
@@ -854,43 +969,45 @@ class Pipe:
         if isinstance(data.get("execution_generation"), int):
             answer["execution_generation"] = data["execution_generation"]
         offered = offered_choices(data.get("choices"), ctx.allowed_choices)
-        if "deny" not in offered:
-            offered.append("deny")
+        if CHOICE_DENY not in offered:
+            offered.append(CHOICE_DENY)
         command, description = str(data.get("command") or ""), str(data.get("description") or "")
         fence = "`" * max(3, max((len(m) for m in re.findall(r"`+", command)), default=0) + 1)
         message = f"{description}\n\n{fence}\n{command}\n{fence}".strip()
+        title = self._t("approval_title")
         reason = ""
-        if ctx.approval_mode == "deny" or offered == ["deny"]:
-            choice, reason = "deny", "automatisch"
+        if ctx.approval_mode == CHOICE_DENY or offered == [CHOICE_DENY]:
+            choice, reason = CHOICE_DENY, self._t("automatic")
         elif ctx.approval_mode == "auto":
-            choice, reason = auto_choice(offered, ctx.auto_choice), "automatisch"
+            choice, reason = auto_choice(offered, ctx.auto_choice), self._t("automatic")
         elif call is None:
             run.parked = True
             self._pending[ctx.key] = {"run_id": run.run_id, "last_id": run.last_id, "streamed": run.streamed,
                                       "answer": answer, "offered": offered}
-            await self._status(emit, "Wartet auf Freigabe", done=True)
-            yield f"\n\n**{APPROVAL_TITLE}**\n\n{message}\n\n{self._approve_hint(offered)}"
+            await self._status(emit, self._t("waiting_approval"), done=True)
+            yield f"\n\n**{title}**\n\n{message}\n\n{self._approve_hint(offered)}"
             return
         else:
-            await self._status(emit, "Wartet auf Freigabe")
-            if set(offered) <= {"once", "deny"}:
+            await self._status(emit, self._t("waiting_approval"))
+            if set(offered) <= {CHOICE_ONCE, CHOICE_DENY}:
                 result, reason = await self._ask(call, {"type": "confirmation", "data": {
-                    "title": APPROVAL_TITLE, "message": message}})
-                choice = "once" if result is True else "deny"
+                    "title": title, "message": message}})
+                choice = CHOICE_ONCE if result is True else CHOICE_DENY
             else:
+                choices = _or_list(offered, self._t("or"))
                 result, reason = await self._ask(call, {"type": "input", "data": {
-                    "title": APPROVAL_TITLE, "message": f"{message}\n\nAntwort: {_or_list(offered)}",
-                    "placeholder": "once", "value": "once"}})
+                    "title": title, "message": self._t("approval_answer", message=message, choices=choices),
+                    "placeholder": CHOICE_ONCE, "value": CHOICE_ONCE}})
                 raw = str(result or "").strip().lower()
                 choice = CHOICE_ALIASES.get(raw, raw)
                 if result is not None and choice not in offered:
-                    reason = f"ungültige Eingabe `{raw[:40]}`"
+                    reason = self._t("invalid_input", raw=raw[:INVALID_INPUT_PREVIEW])
                 if choice not in offered:
-                    choice = "deny"
+                    choice = CHOICE_DENY
         _, err = await self._send(client, ctx, run, "approval", {**answer, "choice": choice})
         run.sent_choice = choice
         yield self._approval_line(choice, reason, err)
-        await self._status(emit, "Hermes arbeitet")
+        await self._status(emit, self._t("working"))
 
     async def _clarify(self, client: Any, ctx: _Ctx, run: _Run, data: dict, call) -> AsyncIterator[Any]:
         rid = data.get("request_id") or data.get("prompt_id")
@@ -898,16 +1015,19 @@ class Pipe:
         if isinstance(data.get("execution_generation"), int):
             answer["execution_generation"] = data["execution_generation"]
         choices = [str(c) for c in data.get("choices") or [] if isinstance(c, (str, int, float))]
-        question = str(data.get("question") or data.get("prompt") or "Hermes hat eine Rückfrage.")
-        message = f"{question}\n\nOptionen: {', '.join(choices)}" if choices else question
+        question = str(data.get("question") or data.get("prompt") or self._t("clarify_default"))
+        message = self._t("clarify_options", question=question, choices=", ".join(choices)) if choices else question
         if call is None:
-            yield f"\n\n**Rückfrage von Hermes:** {message}\n\n*(Ohne Dialog keine Antwort möglich.)*\n\n"
+            yield self._t("clarify_no_dialog", message=message)
             return
         result, reason = await self._ask(call, {"type": "input", "data": {
-            "title": "Rückfrage von Hermes", "message": message, "placeholder": choices[0] if choices else ""}})
+            "title": self._t("clarify_title"), "message": message, "placeholder": choices[0] if choices else ""}})
         text = result.strip() if isinstance(result, str) else ""
         if not text:
-            yield f"\n\n*(Rückfrage nicht beantwortet: {reason or 'leere Antwort'})*\n\n"
+            yield self._t("clarify_unanswered", reason=reason or self._t("empty_answer"))
             return
         _, err = await self._send(client, ctx, run, "clarify", {**answer, "answer": text})
-        yield f"\n\n*(Antwort an Hermes nicht gesendet: {err})*\n\n" if err else f"\n\n*(Antwort an Hermes: {text[:200]})*\n\n"
+        if err:
+            yield self._t("clarify_not_sent", error=err)
+        else:
+            yield self._t("clarify_sent", answer=text[:ANSWER_PREVIEW])

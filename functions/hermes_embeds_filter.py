@@ -1,7 +1,7 @@
 """
 title: Hermes Embeds Filter
 author: Strob0t
-version: 0.1.0
+version: 0.2.0
 license: AGPL-3.0
 description: Converts viz-html code blocks in Hermes responses into native Open WebUI embeds (interactive charts and dashboards).
 required_open_webui_version: 0.12.0
@@ -28,9 +28,29 @@ except ImportError:
         return default
 
 log = logging.getLogger(__name__)
+LOG_PREFIX = "hermes embeds filter"
+
+# --- Defaults (also the valve defaults) -----------------------------------------------------------
+DEFAULT_FENCE_LANG = "viz-html"
+DEFAULT_MAX_BYTES = 60000
+DEFAULT_MAX_EMBEDS = 3
+DEFAULT_KEEP_CODE = False
+DEFAULT_SKIP_PREFIXES = "bifrost."
+DEFAULT_PRIORITY = 5
+DEFAULT_REPLACEMENT_TEXT = "*(chart embedded above)*"
+
+# --- HTML wrapper parts ---------------------------------------------------------------------------
+HTML_HEAD = '<!DOCTYPE html><html><head><meta charset="utf-8"><style>body{margin:0;font-family:system-ui}</style></head>'
+HTML_RESIZE_SCRIPT = ("<script>new ResizeObserver(()=>parent.postMessage({type:'iframe:resize',"
+                      "height:document.body.scrollHeight},'*')).observe(document.body)</script>")
+HTML_TAIL = "</body></html>"
+
+# --- Skip reasons (log only) ----------------------------------------------------------------------
+SKIP_TOO_LARGE = "block size {size} bytes exceeds max_bytes ({limit})"
+SKIP_TOO_MANY = "exceeds max_embeds limit ({limit})"
 
 
-def extract_fences(text: str, lang: str = "viz-html") -> list[tuple[int, int, str]]:
+def extract_fences(text: str, lang: str = DEFAULT_FENCE_LANG) -> list[tuple[int, int, str]]:
     """Extracts fenced code blocks matching the given language tag.
     Returns a list of (start_index, end_index, inner_content).
     Note: Nested backticks inside HTML are not supported by simple fence matching.
@@ -53,13 +73,7 @@ def extract_fences(text: str, lang: str = "viz-html") -> list[tuple[int, int, st
 
 def wrap_html(inner: str) -> str:
     """Wraps HTML inner content into a complete document with DOCTYPE, UTF-8 meta, minimal CSS, and ResizeObserver postMessage script."""
-    return (
-        "<!DOCTYPE html><html><head><meta charset=\"utf-8\">"
-        "<style>body{margin:0;font-family:system-ui}</style></head>"
-        f"<body>{inner}"
-        "<script>new ResizeObserver(()=>parent.postMessage({type:'iframe:resize',height:document.body.scrollHeight},'*')).observe(document.body)</script>"
-        "</body></html>"
-    )
+    return f"{HTML_HEAD}<body>{inner}{HTML_RESIZE_SCRIPT}{HTML_TAIL}"
 
 
 def replace_fences(
@@ -93,11 +107,11 @@ def build_embeds(text: str, valves: Any) -> tuple[str, list[str], list[str]]:
     """Extracts fence blocks, validates size and max count, wraps HTML, replaces text.
     Returns (new_text, html_embeds, skipped_reasons).
     """
-    lang = getattr(valves, "fence_lang", "viz-html")
-    max_bytes = getattr(valves, "max_bytes", 60000)
-    max_embeds = getattr(valves, "max_embeds", 3)
-    keep_code = getattr(valves, "keep_code", False)
-    replacement_text = getattr(valves, "replacement_text", "*(Diagramm oben eingebettet)*")
+    lang = getattr(valves, "fence_lang", DEFAULT_FENCE_LANG)
+    max_bytes = getattr(valves, "max_bytes", DEFAULT_MAX_BYTES)
+    max_embeds = getattr(valves, "max_embeds", DEFAULT_MAX_EMBEDS)
+    keep_code = getattr(valves, "keep_code", DEFAULT_KEEP_CODE)
+    replacement_text = getattr(valves, "replacement_text", DEFAULT_REPLACEMENT_TEXT)
 
     fences = extract_fences(text, lang)
     if not fences:
@@ -110,10 +124,10 @@ def build_embeds(text: str, valves: Any) -> tuple[str, list[str], list[str]]:
     for start, end, content in fences:
         content_bytes = content.encode("utf-8")
         if len(content_bytes) > max_bytes:
-            skipped_reasons.append(f"block size {len(content_bytes)} bytes exceeds max_bytes ({max_bytes})")
+            skipped_reasons.append(SKIP_TOO_LARGE.format(size=len(content_bytes), limit=max_bytes))
             continue
         if len(html_embeds) >= max_embeds:
-            skipped_reasons.append(f"exceeds max_embeds limit ({max_embeds})")
+            skipped_reasons.append(SKIP_TOO_MANY.format(limit=max_embeds))
             continue
 
         wrapped = wrap_html(content)
@@ -131,32 +145,32 @@ class Filter:
             description="Enable or disable the Hermes embeds filter",
         )
         priority: int = Field(
-            default=5,
+            default=DEFAULT_PRIORITY,
             description="Filter priority",
         )
         skip_prefixes: str = Field(
-            default="bifrost.",
+            default=DEFAULT_SKIP_PREFIXES,
             description="Comma-separated model ID prefixes to skip (direct Bifrost connection)",
         )
         max_embeds: int = Field(
-            default=3,
+            default=DEFAULT_MAX_EMBEDS,
             description="Maximum number of embeds per message",
         )
         max_bytes: int = Field(
-            default=60000,
+            default=DEFAULT_MAX_BYTES,
             description="Maximum byte size per embed block",
         )
         keep_code: bool = Field(
-            default=False,
+            default=DEFAULT_KEEP_CODE,
             description="Keep the code block in text alongside the embed",
         )
         fence_lang: str = Field(
-            default="viz-html",
+            default=DEFAULT_FENCE_LANG,
             description="Fence language tag for embed blocks",
         )
         replacement_text: str = Field(
-            default="*(Diagramm oben eingebettet)*",
-            description="Text replacing the embedded code block",
+            default=DEFAULT_REPLACEMENT_TEXT,
+            description="Text replacing the embedded code block (Markdown), e.g. a translation",
         )
         debug: bool = Field(
             default=False,
@@ -214,7 +228,7 @@ class Filter:
                 return body
 
             if self.valves.debug:
-                log.debug("hermes_embeds_filter: emitting %d embeds, skipped: %s", len(html_embeds), skipped)
+                log.debug("%s: emitting %d embeds, skipped: %s", LOG_PREFIX, len(html_embeds), skipped)
 
             await __event_emitter__({
                 "type": "embeds",
@@ -227,6 +241,6 @@ class Filter:
             last_msg["content"] = new_text
 
         except Exception as e:
-            log.warning("hermes embeds filter failed: %s", e)
+            log.warning("%s failed: %s", LOG_PREFIX, e)
 
         return body

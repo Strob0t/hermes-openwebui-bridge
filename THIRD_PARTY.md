@@ -1,13 +1,13 @@
-# Third-Party Patterne & Quellen
+# Third-Party Patterns & Sources
 
-Dieses Projekt orientiert sich konzeptionell an folgenden Open-Source-Projekten (MIT-lizenziert):
+This project draws conceptual inspiration from the following open-source projects (MIT licensed):
 
 1. **`MartianInGreen/openwebui-hermes`** (MIT)
-   - *Genutztes Muster:* SSE-Frame-Parsing, Statuszeilen-Transformation für Hermes-Agenten in Open WebUI.
-   - *Code-Übernahme:* Aktuell kein Code kopiert (Konzeptvorlage).
+   - *Used pattern:* SSE frame parsing, status line transformation for Hermes agents in Open WebUI.
+   - *Code adoption:* Currently no code copied (conceptual template).
 
 2. **`nicolasramos/hermes-openwebui-pipeline`** (MIT)
-   - *Genutztes Muster:* Anbindung von Hermes-Endpoints, Bild-Handling im Chat-Stream.
-   - *Code-Übernahme:* Aktuell kein Code kopiert (Konzeptvorlage).
+   - *Used pattern:* Connection of Hermes endpoints, image handling in the chat stream.
+   - *Code adoption:* Currently no code copied (conceptual template).
 
-> **Hinweis zur Lizenz:** Falls in späteren Teilen Code aus MIT-lizenzierten Projekten übernommen wird, ist der ursprüngliche Copyright-Header und Lizenztext direkt im jeweiligen Modul beizubehalten.
+> **License Notice:** If code from MIT-licensed projects is adopted in later parts, the original copyright header and license text must be retained directly in the respective module.

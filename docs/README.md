@@ -1,17 +1,17 @@
-# Dokumentation & Research
+# Documentation & Research
 
-Dieses Verzeichnis enthält die Recherche, Ist-Analysen und Architekturentscheidungen (ADRs) für die Brücke zwischen Hermes und Open WebUI.
+This directory contains the research, current-state analyses, and architectural decision records (ADRs) for the bridge between Hermes and Open WebUI.
 
-## Inhalt
+## Contents
 
 - **Research (`docs/research/`)**:
-  - `01-quellensammlung.md`: Ursprüngliche Quellensammlung und Issue-Referenzen.
-  - `02-ist-analyse-bericht.md`: Umfassender IST-Zustand, Optionenvergleich und Maßnahmenplan (M1–M7).
-  - `03-arbeitsnotizen.md`: Rohnotizen und Handoff-Informationen.
+  - `01-source-collection.md`: Initial source collection and issue references.
+  - `02-current-state-report.md`: Comprehensive current state, option comparison, and action plan (M1–M7).
+  - `03-working-notes.md`: Raw notes and handoff information.
 
-- **Architekturentscheidungen (`docs/decisions/`)**:
-  - `0001-filter-not-pipe.md`: Entscheidung für einen Open-WebUI-Filter statt einer Pipe für Embeds.
-  - `0002-runs-pipe.md`: Pipe für Hermes `/v1/runs` (Freigaben, Session-Header, Manifold).
+- **Architectural Decisions (`docs/decisions/`)**:
+  - `0001-filter-not-pipe.md`: Decision for an Open WebUI filter instead of a pipe for embeds.
+  - `0002-runs-pipe.md`: Pipe for Hermes `/v1/runs` (approvals, session headers, manifold).
 
-- **Spezifikationen (`docs/spec/`)**:
-  - `hermes-runs-pipe.md`: Spezifikation der Runs-Pipe (Abschnitt 10 gilt vor 2, 3 und 5).
+- **Specifications (`docs/spec/`)**:
+  - `hermes-runs-pipe.md`: Specification of the Runs-Pipe (Section 10 takes precedence over 2, 3, and 5).

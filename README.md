@@ -1,31 +1,31 @@
 # Hermes OpenWebUI Bridge
 
-Brücke zwischen dem **Hermes Agent** (als API-Backend und Tool-Runner) und **Open WebUI** (als Chat-Oberfläche).
+Bridge between the **Hermes Agent** (as API backend and tool runner) and **Open WebUI** (as chat interface).
 
-## Zweck & Hintergrund
+## Purpose & Background
 
-Hermes führt Tools eigenständig serverseitig aus. Open WebUI erwartet im Standard, dass Tools in der Benutzeroberfläche direkt über WebUI-Tools oder integrierte Pipes/Actions laufen. Da Hermes-Tools und offene Visualisierungen (wie `MEDIA:`-Dateipfade oder interaktive Dashboards) ohne Anpassung nicht im Open-WebUI-Stream ankommen, verbindet dieses Projekt beide Welten, ohne die Vorteile des Routers (`hermes-models`) und bestehender Filter (wie `hermes_reasoning_filter.py`) zu verlieren.
+Hermes executes tools independently on the server side. By default, Open WebUI expects tools in the user interface to run directly via WebUI tools or integrated pipes/actions. Since Hermes tools and open visualizations (such as `MEDIA:` file paths or interactive dashboards) do not arrive in the Open WebUI stream without adjustment, this project connects both worlds without losing the advantages of the router (`hermes-models`) and existing filters (such as `hermes_reasoning_filter.py`).
 
-Ausführliche Analysen und Entscheidungen befinden sich im Ordner [`docs/`](docs/README.md).
+Detailed analyses and decisions can be found in the [`docs/`](docs/README.md) folder.
 
-## Komponenten & Status
+## Components & Status
 
-| Komponente | Typ | Status | Beschreibung |
+| Component | Type | Status | Description |
 |---|---|---|---|
-| `skills/openwebui-visuals` | Hermes Skill | **in Arbeit** | Formatanweisungen für Hermes (Mermaid, SVG, HTML-Artifacts, `MEDIA:`-Fallback) |
-| `functions/hermes_embeds_filter.py` | Open WebUI Filter | **fertig (ungetestet live)** | Wandelt ```viz-html Blöcke in native Open-WebUI `embeds` (Iframe mit Chart.js / Dashboards) |
-| `functions/hermes_runs_pipe.py` | Open WebUI Pipe (Manifold) | **0.2.0, Modell-Discovery, ungetestet live** | Anbindung von `/v1/runs`, Freigaben und Session-Header (ADR [0002](docs/decisions/0002-runs-pipe.md), Spezifikation [`docs/spec/hermes-runs-pipe.md`](docs/spec/hermes-runs-pipe.md)) |
-| `router/` / Router-Integration | AIOHTTP Relay | **beobachtet** | Pufferung von SSE-Frames, Reasoning-Konvertierung, geplantes MEDIA-Inlining |
+| `skills/openwebui-visuals` | Hermes Skill | **in progress** | Format instructions for Hermes (Mermaid, SVG, HTML-Artifacts, `MEDIA:`-fallback) |
+| `functions/hermes_embeds_filter.py` | Open WebUI Filter | **0.2.0, installed in stack `ki`** | Converts ```viz-html blocks to native Open-WebUI `embeds` (iframe with Chart.js / dashboards) |
+| `functions/hermes_runs_pipe.py` | Open WebUI Pipe (Manifold) | **0.3.0, model discovery, English texts via `TEXTS` valve** | Integration of `/v1/runs`, approvals, and session headers (ADR [0002](docs/decisions/0002-runs-pipe.md), specification [`docs/spec/hermes-runs-pipe.md`](docs/spec/hermes-runs-pipe.md)) |
+| `router/` / Router integration | AIOHTTP Relay | **monitored** | Buffering of SSE frames, reasoning conversion, planned MEDIA inlining |
 
-## Installation & Hinweise
+## Installation & Notes
 
-- **Hermes Skill:** Kopieren nach `$HERMES_HOME/skills/creative/openwebui-visuals/` (siehe [`skills/openwebui-visuals/README.md`](skills/openwebui-visuals/SKILL.md)).
-- **Open WebUI Functions:** Import über Admin-Bereich von Open WebUI (siehe [`functions/README.md`](functions/README.md)).
+- **Hermes Skill:** Copy to `$HERMES_HOME/skills/creative/openwebui-visuals/` (see [`skills/openwebui-visuals/README.md`](skills/openwebui-visuals/SKILL.md)).
+- **Open WebUI Functions:** Import via Open WebUI admin area (see [`functions/README.md`](functions/README.md)).
 
-## Lizenz
+## License
 
-Dieses Projekt steht unter der **GNU AGPL v3.0** (siehe [LICENSE](LICENSE)).
+This project is licensed under the **GNU AGPL v3.0** (see [LICENSE](LICENSE)).
 
-## Drittanbieter & Muster
+## Third Party & Patterns
 
-Siehe [`THIRD_PARTY.md`](THIRD_PARTY.md) für genutzte Muster und Inspirationsquellen (MIT-Lizenzen).
+See [`THIRD_PARTY.md`](THIRD_PARTY.md) for used patterns and sources of inspiration (MIT licenses).

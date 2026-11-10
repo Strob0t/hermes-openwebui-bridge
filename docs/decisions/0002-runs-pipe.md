@@ -1,43 +1,43 @@
-# ADR 0002: Pipe für Hermes `/v1/runs` (Freigaben und Session-Mapping)
+# ADR 0002: Pipe for Hermes `/v1/runs` (Approvals and Session Mapping)
 
-- Status: akzeptiert (2026-11-09)
-- Bezug: ADR 0001 (Filter statt Pipe für Embeds), `docs/research/02-ist-analyse-bericht.md` Maßnahme M8
+- Status: accepted (2026-11-09)
+- Reference: ADR 0001 (Filter instead of Pipe for Embeds), `docs/research/02-current-state-report.md` Measure M8
 
-## Kontext
+## Context
 
-Open WebUI spricht heute über `owui-relay` und den Router `hermes-models` mit Hermes `/v1/chat/completions`. Der Router wandelt `hermes.tool.progress` in `reasoning_content` um und stoppt Runs bei Client-Abbruch (belegt: Bericht, Abschnitt 1c). Er hat keinen Rückkanal für Tool-Freigaben: Fordert Hermes eine Freigabe an, kann der Nutzer in Open WebUI nicht antworten.
+Open WebUI currently talks to Hermes `/v1/chat/completions` via `owui-relay` and the `hermes-models` router. The router converts `hermes.tool.progress` into `reasoning_content` and stops runs on client abortion (proven: report, section 1c). It has no backchannel for tool approvals: if Hermes requests an approval, the user cannot answer in Open WebUI.
 
-Hermes v0.23.0 bietet dafür die Run-API (belegt: `gateway/platforms/api_server_runs.py` Z.286-292):
+Hermes v0.23.0 provides the run API for this (proven: `gateway/platforms/api_server_runs.py` l.286-292):
 `POST /v1/runs`, `GET /v1/runs/{id}`, `GET /v1/runs/{id}/events` (SSE), `POST /v1/runs/{id}/approval`, `/clarify`, `/steer`, `/stop`.
 
-## Entscheidung
+## Decision
 
-Eine Open-WebUI-Pipe `functions/hermes_runs_pipe.py` spricht `/v1/runs` direkt an. Sie erscheint in Open WebUI als eigenes Modell `hermes-runs`.
+An Open WebUI pipe `functions/hermes_runs_pipe.py` addresses `/v1/runs` directly. It appears in Open WebUI as a separate model `hermes-runs`.
 
-Ein Filter reicht nicht: Filter sehen nur den Request (`inlet`) und die fertige Antwort (`outlet`/`stream`). Eine Freigabe braucht eine Rückfrage an den Nutzer mitten im Stream (`__event_call__`) und danach einen zweiten HTTP-Aufruf an Hermes. Das kann nur eine Pipe.
+A filter is not enough: Filters only see the request (`inlet`) and the completed response (`outlet`/`stream`). An approval needs a query back to the user in the middle of the stream (`__event_call__`) and then a second HTTP call to Hermes. Only a pipe can do this.
 
-## Alternativen
+## Alternatives
 
-1. Router `hermes-models` erweitern. Abgelehnt: Der Router ist ein OpenAI-kompatibler Proxy ohne UI-Rückkanal. Eine Freigabe müsste als Text in den Stream und als neue Nutzernachricht zurück, mit Sitzungszustand im Router. Das vermischt Proxy und Dialoglogik.
-2. Bei Chat Completions bleiben und Freigaben in Hermes auf `auto` stellen. Abgelehnt: Dann gibt es keine Freigaben mehr, oder Hermes wartet ohne Antwort.
-3. MartianInGreen/openwebui-hermes übernehmen. Abgelehnt (siehe Bericht): eingefrorener Debug-Stand. Übernommen werden nur die Muster.
+1. Extend the `hermes-models` router. Rejected: The router is an OpenAI-compatible proxy without a UI backchannel. An approval would have to go into the stream as text and back as a new user message, with session state in the router. This mixes proxy and dialog logic.
+2. Stick with chat completions and set approvals in Hermes to `auto`. Rejected: Then there are no approvals anymore, or Hermes waits without an answer.
+3. Adopt MartianInGreen/openwebui-hermes. Rejected (see report): frozen debug state. Only the patterns are adopted.
 
-## Konsequenzen
+## Consequences
 
-- Zweiter Modelleintrag in Open WebUI (`hermes-runs`). `hermes-agent` über den Router bleibt für Familienchats und einfache Fragen.
-- Die Pipe hält das Mapping `chat_id -> session_id` selbst. Nach einem Neustart von Open WebUI geht es verloren, wenn die Datei-Persistenz (Valve) aus ist.
-- Fortschritt (`tool.started`, `tool.completed`) muss die Pipe selbst als `reasoning_content` oder Status-Event ausgeben. Der Router macht das für sie nicht.
-- Filter: Open-WebUI-Filter gelten auch für Pipe-Modelle, wenn sie dem Modell oder global zugeordnet sind (Open-WebUI-Doku Filter Function; für v0.12.4 ungeprüft). `hermes_embeds` bleibt damit nutzbar.
+- Second model entry in Open WebUI (`hermes-runs`). `hermes-agent` via the router remains for family chats and simple questions.
+- The pipe maintains the mapping `chat_id -> session_id` itself. After a restart of Open WebUI, it is lost if file persistence (valve) is off.
+- Progress (`tool.started`, `tool.completed`) must be emitted by the pipe itself as `reasoning_content` or status event. The router does not do this for it.
+- Filters: Open WebUI filters also apply to pipe models if assigned to the model or globally (Open WebUI doc Filter Function; unverified for v0.12.4). `hermes_embeds` thus remains usable.
 
-## Nachtrag 2026-11-09
+## Addendum 2026-11-09
 
-- Pfad: Die Pipe geht über `owui-relay` und `hermes-models` (`hermes-gw.hermes:8642`). Belegt: der Router reicht `/v1/runs/*` frame-weise durch und ändert nur `hermes.tool.progress`-Frames (`app.py`, `other`/`proxy`/`Relay.frame`). Alternative 1 oben bleibt abgelehnt, weil kein Code im Router nötig ist. Kein Netzumbau; Hermes bleibt nur im Netz `internal`.
-- Session: `X-Hermes-Session-Key` statt eigenem Mapping (Spec 10.2). Konsequenz "Mapping geht bei Neustart verloren" entfällt.
-- Freigaben: Angebot = Schnittmenge aus Hermes-`choices` und Admin-Valve `ALLOWED_APPROVAL_CHOICES` (Default `once,deny,session`); `APPROVAL_MODE=auto` für die Owner-Gruppe, Manifold mit Modellen pro Gruppe (Spec 10.3, 10.4). Entscheidung Steffen: viel Freiheit für den Owner, konservative Defaults für andere Nutzer des Repos.
-- Rollen: Valve `ALLOWED_ROLES` (Default `admin`), weil `family_note` des Routers auf `/v1/runs` nicht wirkt.
+- Path: The pipe goes through `owui-relay` and `hermes-models` (`hermes-gw.hermes:8642`). Proven: the router forwards `/v1/runs/*` frame by frame and only modifies `hermes.tool.progress` frames (`app.py`, `other`/`proxy`/`Relay.frame`). Alternative 1 above remains rejected because no code in the router is needed. No network redesign; Hermes remains in the `internal` network only.
+- Session: `X-Hermes-Session-Key` instead of custom mapping (Spec 10.2). The consequence "mapping is lost on restart" no longer applies.
+- Approvals: Offer = intersection of Hermes `choices` and admin valve `ALLOWED_APPROVAL_CHOICES` (default `once,deny,session`); `APPROVAL_MODE=auto` for the owner group, manifold with models per group (Spec 10.3, 10.4). Decision Steffen: a lot of freedom for the owner, conservative defaults for other users of the repo.
+- Roles: Valve `ALLOWED_ROLES` (default `admin`), because `family_note` of the router does not affect `/v1/runs`.
 
-## Risiken
+## Risks
 
-- Freigabe-Timeout: Hermes hält den Run in `waiting_for_approval`. Die Pipe sendet nach `approval_timeout` `deny`.
-- Parallele Nachrichten im selben Chat teilen eine Session. Hermes meldet einen Routenkonflikt mit 400; die Pipe zeigt den Fehler an.
-- Ein Freigabe-Dialog in Open WebUI zeigt den geplanten Befehl. Hermes redigiert Secrets vor dem Senden (`_redact_approval_command`, belegt `api_server.py` Z.97).
+- Approval timeout: Hermes holds the run in `waiting_for_approval`. The pipe sends `deny` after `approval_timeout`.
+- Parallel messages in the same chat share a session. Hermes reports a route conflict with 400; the pipe displays the error.
+- An approval dialog in Open WebUI shows the planned command. Hermes redacts secrets before sending (`_redact_approval_command`, proven `api_server.py` l.97).
