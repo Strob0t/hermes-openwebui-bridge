@@ -173,3 +173,11 @@ Removed: 1-3 (mapping, TTL, file). New:
 
 - All user-facing texts are English and live in one table `TEXTS` at the top of the module. The valve `TEXTS` (JSON object) overrides single keys; unknown keys and non-string values are dropped, invalid JSON keeps the defaults and logs a warning. A format placeholder that the override does not provide falls back to the default text.
 - Protocol constants (header names, choices, statuses, limits) are module constants. Open WebUI loads a function from one file, so the module stays one file with sections: constants and texts, pure helpers, request context, `Pipe`.
+
+### 10.7 Model options and multi-model setup (0.4.0)
+
+- Owner decision 2026-11-12: all Open WebUI picker models run through this pipe (`/v1/runs`). The pipe lists them with `MODEL_FILTER` (regex, `re.search`) and `OWNED_BY_FILTER` (comma list, case-insensitive).
+- New valve `MODEL_OPTIONS_KEYS` (comma list, default `reasoning_effort`). The run body gets `model_options` with the keys of `body.model_options` in this list; values go through as given; other keys are dropped. Hermes reads `model_options.reasoning_effort` (`gateway/platforms/api_server_request_options.py`, `_request_reasoning_config`).
+- A top-level `reasoning_effort` in the request body (the Open WebUI slider of connection models) fills `model_options.reasoning_effort` if `model_options` has none and the key is in the list.
+- No allowed option: no `model_options` in the run body; Hermes `config.yaml` decides.
+- Tests: `test_run_model_options`, `test_run_body_model_options` (pass-through, allowlist drop, slider mapping, no options), `test_owned_by_comma_list`, `test_short_model_id_dots_and_slashes`.

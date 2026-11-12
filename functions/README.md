@@ -55,6 +55,7 @@ Manifold pipe: models arrive via discovery from `GET <HERMES_BASE_URL>/models` (
 | `OWNED_BY_FILTER` | `str` | `""` | Only models with these `owned_by` values, comma-separated; empty = all |
 | `MODELS_CACHE_TTL` | `int` | `300` | Seconds cache for the model list. On load error: last list remains; without a list, entry `Hermes (Gateway-Default)` |
 | `MODEL_POLICIES` | `str` (JSON) | `[]` | List of `{"match": <Regex on model ID>, ...}`; first match wins and may override `approval_mode`, `allowed_approval_choices`, `auto_choice`, `allowed_roles`. Invalid JSON: no policies and warning in log |
+| `MODEL_OPTIONS_KEYS` | `str` | `reasoning_effort` | Comma-separated keys of `body.model_options` that go into the run body as `model_options`; values unchanged, other keys dropped. A top-level `reasoning_effort` fills `model_options.reasoning_effort` if `model_options` has none. Empty = no `model_options` |
 | `ROUTE_HEADER` | `str` | `X-Hermes-Route` | Response header from `POST /runs` that appears as status line `Route: ...` (for routing proxies); empty = off |
 | `REQUEST_TIMEOUT` | `int` | `30` | Seconds for `POST /runs`, `/approval`, `/clarify`, `/stop`, `GET /runs/{id}` |
 | `STREAM_IDLE_TIMEOUT` | `int` | `900` | Seconds without event in stream (keepalives do not count), then `stop` and error line |
@@ -87,6 +88,30 @@ Manifold pipe: models arrive via discovery from `GET <HERMES_BASE_URL>/models` (
 - Second rule: all other models; every approval as yes/no dialog, only `once` or `deny`.
 - Without a match, global valves apply (`APPROVAL_MODE`, `ALLOWED_APPROVAL_CHOICES`, `AUTO_CHOICE`, `ALLOWED_ROLES`).
 
+### Model Options (`MODEL_OPTIONS_KEYS`)
+
+Hermes reads a per-request reasoning effort only as `model_options.reasoning_effort` in the run body. The pipe builds `model_options` from the Open WebUI request body:
+
+1. Keys of `body.model_options` that are in `MODEL_OPTIONS_KEYS` go through with their value unchanged (the filter `hermes_reasoning` sets `body.model_options.reasoning_effort`). Other keys are dropped.
+2. If `model_options` has no `reasoning_effort` and the request has a top-level `reasoning_effort` (the Open WebUI slider of connection models), the pipe uses that value. This applies only if `reasoning_effort` is in `MODEL_OPTIONS_KEYS`.
+3. No allowed option: the run body has no `model_options`, and Hermes `config.yaml` decides.
+
+Example: `MODEL_OPTIONS_KEYS=reasoning_effort,service_tier` also passes `model_options.service_tier`.
+
+### Multi-Model Setup
+
+All Open WebUI picker models run through this pipe (`/v1/runs`). One pipe instance lists the Hermes classes and the provider models; the filters select the picker entries:
+
+```text
+MODEL_FILTER=^(auto|claude-sub/claude-[a-z0-9-]+|premiumize/.+)$
+OWNED_BY_FILTER=hermes,bifrost
+MODEL_OPTIONS_KEYS=reasoning_effort
+```
+
+- `MODEL_FILTER` is a regex (`re.search`, so use `^...$` for a full match). `OWNED_BY_FILTER` is a comma list; case and spaces do not matter. A model must pass both filters.
+- Open WebUI model id: `<function id>.<entry id>`. The pipe splits at the first `.` only, so entry ids with dots and slashes (for example `premiumize/gpt-6.1-sol`) stay whole and go unchanged as `model` to Hermes.
+- `ALLOWED_ROLES` applies to the whole pipe; use `MODEL_POLICIES` (`allowed_roles`) and the Open WebUI model permissions for each model.
+
 ### Operation Behind a Routing Proxy
 
 If there is a proxy in front of Hermes answering `/v1/models` with its own model IDs (e.g. classes like `auto`, `auto-medium`, `auto-strong` plus passed-through provider models), the pipe lists exactly these IDs. Typical settings:
@@ -97,7 +122,7 @@ If there is a proxy in front of Hermes answering `/v1/models` with its own model
 
 ### Behavior
 
-- Request to Hermes: `POST /runs` with `{"input": <last user message>, "stream": false, "model": <selected ID>}` (plus `provider` if discovery provides one; without `model` for entry `hermes-default`) and `Idempotency-Key: owui:<chat_id>:<message_id>`; then `GET /runs/{id}/events` (SSE).
+- Request to Hermes: `POST /runs` with `{"input": <last user message>, "stream": false, "model": <selected ID>}` (plus `provider` if discovery provides one; plus `model_options` if the request has allowed options, see `MODEL_OPTIONS_KEYS`; without `model` for entry `hermes-default`) and `Idempotency-Key: owui:<chat_id>:<message_id>`; then `GET /runs/{id}/events` (SSE).
 - Header on all requests: `X-Hermes-Session-Key: owui:<user_id>:<chat_id>` (Hermes loads history itself), `X-Hermes-User-Role`, `X-Hermes-User-Name` (URL encoded as in Open WebUI), `Accept-Encoding: identity`, `Authorization` if key set.
 - Text (`message.delta`, `message.interim`, rest of `run.completed.output`) goes as `content` into the stream.
 - Tool progress: `__event_emitter__` type `status` and additionally `delta.reasoning_content` chunks (dict). Open WebUI v0.12.4 (`functions.py`, `process_line`) passes a dict as `data: <json>`, the middleware reads `delta.reasoning_content` as a reasoning block. Without `stream`, Open WebUI combines all chunks with `str()`; then the pipe sends no dict chunks, only status events.

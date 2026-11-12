@@ -4,6 +4,9 @@ All noteworthy changes to this project are documented in this file.
 
 ## [Unreleased]
 
+### Added
+- Runs-Pipe 0.4.0: run body carries `model_options` from the request (new valve `MODEL_OPTIONS_KEYS`, comma allowlist, default `reasoning_effort`; values unchanged, other keys dropped). A top-level `reasoning_effort` (Open WebUI slider of connection models) fills `model_options.reasoning_effort` if `model_options` has none. Without an allowed option the body has no `model_options`. Fixes: the filter `hermes_reasoning` had no effect on pipe models. Docs: sections "Model Options" and "Multi-Model Setup" in `functions/README.md`, spec 10.7, work directory in `README.md`. New tests `test_run_model_options`, `test_run_body_model_options`, `test_owned_by_comma_list`, `test_short_model_id_dots_and_slashes`.
+
 ### Changed
 - Runs-Pipe 0.3.0: all user-facing texts are English and live in one `TEXTS` table at the top of the module; the valve `TEXTS` (JSON object) overrides single keys. Protocol constants (headers, choices, statuses, limits) are module constants; the module is split into sections (constants, pure helpers, request context, `Pipe`). New test `test_texts_valve_override`.
 - Embeds filter 0.2.0: valve defaults, HTML wrapper parts and skip reasons are module constants; default `replacement_text` is English (`*(chart embedded above)*`).

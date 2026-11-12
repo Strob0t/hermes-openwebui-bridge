@@ -1,7 +1,7 @@
 """
 title: Hermes Runs Pipe
 author: Strob0t
-version: 0.3.0
+version: 0.4.0
 license: AGPL-3.0
 description: Runs Open WebUI chats as Hermes runs over /v1/runs, with model discovery, tool progress, approval dialogs and one Hermes session per chat.
 required_open_webui_version: 0.12.0
@@ -45,6 +45,8 @@ LOG_PREFIX = "hermes runs pipe"
 
 # --- Protocol constants -------------------------------------------------------------------------
 DEFAULT_MODEL_ID = "hermes-default"
+MODEL_OPTIONS_FIELD = "model_options"
+EFFORT_OPTION = "reasoning_effort"
 POLICY_KEYS = ("approval_mode", "allowed_approval_choices", "auto_choice", "allowed_roles")
 APPROVAL_CHOICES = ("once", "session", "always", "deny")
 APPROVAL_MODES = ("ask", "auto", "deny")
@@ -228,6 +230,21 @@ def parse_model_list(data: Any, id_filter: str = "", owned_by_csv: str = "") -> 
             entry["provider"] = item["provider"].strip()
         models.append(entry)
     return models
+
+
+def run_model_options(body: Any, keys_csv: Any) -> dict:
+    """Returns the model_options for POST /runs: the keys of body.model_options in the allowlist, values as given.
+    A top-level reasoning_effort (the Open WebUI slider of connection models) fills model_options.reasoning_effort
+    if model_options has none. Keys outside the allowlist are dropped; a top-level None counts as absent.
+    """
+    if not isinstance(body, dict):
+        return {}
+    allowed = _csv(keys_csv)
+    raw = body.get(MODEL_OPTIONS_FIELD)
+    options = {k: v for k, v in raw.items() if k in allowed} if isinstance(raw, dict) else {}
+    if EFFORT_OPTION in allowed and EFFORT_OPTION not in options and body.get(EFFORT_OPTION) is not None:
+        options[EFFORT_OPTION] = body[EFFORT_OPTION]
+    return options
 
 
 def session_key(user_id: str, chat_id: str, reset_count: int = 0) -> str:
@@ -416,6 +433,7 @@ class _Ctx:
         entry = pipe.model_entry(self.short_model)
         self.run_model = "" if not entry or entry.get("default") else str(entry.get("id") or "")
         self.run_provider = str(entry.get("provider") or "") if entry else ""
+        self.model_options = run_model_options(body, v.MODEL_OPTIONS_KEYS)
         policy = policy_for(self.short_model, pipe.policies())
         mode = str(policy.get("approval_mode") or v.APPROVAL_MODE or "").strip().lower()
         if mode not in APPROVAL_MODES:
@@ -427,12 +445,16 @@ class _Ctx:
         self.allowed_roles = policy.get("allowed_roles") or v.ALLOWED_ROLES
 
     def run_body(self, text: str) -> dict:
-        """Returns the POST /runs body; model and provider only for a discovered model, not for the default entry."""
+        """Returns the POST /runs body; model and provider only for a discovered model, not for the default entry.
+        model_options (MODEL_OPTIONS_KEYS allowlist) only if the request has at least one allowed option.
+        """
         body: dict = {"input": text, "stream": False}
         if self.run_model:
             body["model"] = self.run_model
             if self.run_provider:
                 body["provider"] = self.run_provider
+        if self.model_options:
+            body[MODEL_OPTIONS_FIELD] = dict(self.model_options)
         return body
 
     def headers(self, pipe: "Pipe", **extra: str) -> dict:
@@ -490,6 +512,10 @@ class Pipe:
         MODEL_POLICIES: str = Field(
             default="[]",
             description='JSON list of {"match": <regex on model id>, "approval_mode", "allowed_approval_choices", "auto_choice", "allowed_roles"}; first match wins',
+        )
+        MODEL_OPTIONS_KEYS: str = Field(
+            default=EFFORT_OPTION,
+            description="Comma-separated keys of body.model_options that go to POST /runs (a top-level reasoning_effort fills reasoning_effort); other keys are dropped; empty = none",
         )
         ROUTE_HEADER: str = Field(
             default="X-Hermes-Route",

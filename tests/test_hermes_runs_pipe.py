@@ -34,6 +34,18 @@ MODELS_RESP = {"object": "list", "data": [
     {"id": "anthropic/claude", "object": "model", "owned_by": "bifrost", "name": "Claude", "provider": "bifrost"},
 ]}
 
+# Multi-model setup of the README: Hermes classes, the Claude subscription and premiumize models via Bifrost.
+MULTI_RESP = {"object": "list", "data": [
+    {"id": "auto", "owned_by": "hermes"},
+    {"id": "auto-medium", "owned_by": "hermes"},
+    {"id": "claude-sub/claude-opus-5-5", "owned_by": "Bifrost"},
+    {"id": "premiumize/gpt-6.1-sol", "owned_by": "bifrost"},
+    {"id": "premiumize/gpt-6.1-sol", "owned_by": "other"},
+    {"id": "openai/gpt-6.1", "owned_by": "bifrost"},
+    {"id": "claude-sub/claude.x", "owned_by": "bifrost"},
+]}
+MULTI_FILTER = r"^(auto|claude-sub/claude-[a-z0-9-]+|premiumize/.+)$"
+
 
 def ev(name, **fields):
     return name, fields
@@ -136,19 +148,19 @@ def make_pipe(*streams, extra=None, models=None, **valves):
     return p, client
 
 
-def body_for(text, stream=True, model=MODEL):
-    return {"model": model, "stream": stream, "messages": [{"role": "user", "content": text}]}
+def body_for(text, stream=True, model=MODEL, **fields):
+    return {"model": model, "stream": stream, "messages": [{"role": "user", "content": text}], **fields}
 
 
-def run_pipe(p, text="Hello", stream=True, user=None, meta=None, call=None, model=MODEL):
-    """Runs the pipe to its end. Returns (chunks, emitted events)."""
+def run_pipe(p, text="Hello", stream=True, user=None, meta=None, call=None, model=MODEL, **fields):
+    """Runs the pipe to its end. Returns (chunks, emitted events). fields go into the request body."""
     emitted = []
 
     async def emit(event):
         emitted.append(event)
 
     async def go():
-        agen = p.pipe(body_for(text, stream, model), __user__=dict(user or USER),
+        agen = p.pipe(body_for(text, stream, model, **fields), __user__=dict(user or USER),
                       __metadata__=dict(meta or META), __event_emitter__=emit, __event_call__=call)
         return await _collect(agen)
 
@@ -204,6 +216,45 @@ class TestHelpers(unittest.TestCase):
         self.assertEqual(pipe_mod.parse_model_list({"data": [{"name": "no id"}]}), [])
         with self.assertLogs(pipe_mod.log, level="WARNING"):
             self.assertEqual(len(pipe_mod.parse_model_list(MODELS_RESP, id_filter="(")), 4)
+
+    def test_owned_by_comma_list(self):
+        # 0.4.0: OWNED_BY_FILTER is a comma list (case and spaces do not matter); MODEL_FILTER stays a regex.
+        models = pipe_mod.parse_model_list(MULTI_RESP, MULTI_FILTER, " hermes , BIFROST ")
+        self.assertEqual([(m["id"], m["owned_by"]) for m in models], [
+            ("auto", "hermes"), ("claude-sub/claude-opus-5-5", "Bifrost"), ("premiumize/gpt-6.1-sol", "bifrost")])
+        self.assertEqual([m["id"] for m in pipe_mod.parse_model_list(MULTI_RESP, owned_by_csv="hermes")],
+                         ["auto", "auto-medium"])
+        self.assertEqual(len(pipe_mod.parse_model_list(MULTI_RESP, owned_by_csv=",")), len(MULTI_RESP["data"]))
+
+    def test_short_model_id_dots_and_slashes(self):
+        short = pipe_mod.Pipe.short_model_id
+        self.assertEqual(short("hermes_runs_pipe.premiumize/gpt-6.1-sol"), "premiumize/gpt-6.1-sol")
+        self.assertEqual(short("hermes_runs_pipe.claude-sub/claude-opus-5-5"), "claude-sub/claude-opus-5-5")
+        self.assertEqual(short("hermes_runs_pipe.auto"), "auto")
+        self.assertEqual(short("auto"), "auto")
+
+    def test_run_model_options(self):
+        keys = "reasoning_effort"
+        self.assertEqual(pipe_mod.run_model_options({"model_options": {"reasoning_effort": "high"}}, keys),
+                         {"reasoning_effort": "high"})
+        # Values go through as given; keys outside the allowlist are dropped.
+        self.assertEqual(pipe_mod.run_model_options(
+            {"model_options": {"reasoning_effort": "Max ", "service_tier": "priority", "fast": True}}, keys),
+            {"reasoning_effort": "Max "})
+        self.assertEqual(pipe_mod.run_model_options(
+            {"model_options": {"reasoning_effort": "low", "service_tier": "priority"}}, "reasoning_effort, service_tier"),
+            {"reasoning_effort": "low", "service_tier": "priority"})
+        # Top-level slider value only if model_options has no reasoning_effort.
+        self.assertEqual(pipe_mod.run_model_options({"reasoning_effort": "medium"}, keys), {"reasoning_effort": "medium"})
+        self.assertEqual(pipe_mod.run_model_options(
+            {"reasoning_effort": "medium", "model_options": {"reasoning_effort": "xhigh"}}, keys),
+            {"reasoning_effort": "xhigh"})
+        self.assertEqual(pipe_mod.run_model_options({"reasoning_effort": "medium"}, "service_tier"), {})
+        self.assertEqual(pipe_mod.run_model_options({"reasoning_effort": None}, keys), {})
+        self.assertEqual(pipe_mod.run_model_options({"model_options": {"reasoning_effort": "high"}}, ""), {})
+        self.assertEqual(pipe_mod.run_model_options({"model_options": "high"}, keys), {})
+        self.assertEqual(pipe_mod.run_model_options({}, keys), {})
+        self.assertEqual(pipe_mod.run_model_options(None, keys), {})
 
     def test_session_key(self):
         self.assertEqual(pipe_mod.session_key("u1", "c1"), "owui:u1:c1")
@@ -354,6 +405,35 @@ class TestDiscovery(unittest.TestCase):
         p, client = make_pipe(sse(DONE), models={"data": []})
         run_pipe(p, model="hermes_runs_pipe.auto-strong")
         self.assertEqual(client.find("POST", "/runs")[0][3]["model"], "auto-strong")
+
+    def test_run_body_model_options(self):
+        # 0.4.0: options pass-through (filter hermes_reasoning sets model_options.reasoning_effort).
+        p, client = make_pipe(sse(DONE), models=MULTI_RESP)
+        run_pipe(p, model="hermes_runs_pipe.premiumize/gpt-6.1-sol", model_options={"reasoning_effort": "high"})
+        self.assertEqual(client.find("POST", "/runs")[0][3], {
+            "input": "Hello", "stream": False, "model": "premiumize/gpt-6.1-sol",
+            "model_options": {"reasoning_effort": "high"}})
+        # Allowlist drop: only MODEL_OPTIONS_KEYS go through.
+        p, client = make_pipe(sse(DONE))
+        run_pipe(p, model_options={"reasoning_effort": "low", "service_tier": "priority", "api_key": "x"})
+        self.assertEqual(client.find("POST", "/runs")[0][3]["model_options"], {"reasoning_effort": "low"})
+        p, client = make_pipe(sse(DONE), MODEL_OPTIONS_KEYS="")
+        run_pipe(p, model_options={"reasoning_effort": "low"}, reasoning_effort="high")
+        self.assertNotIn("model_options", client.find("POST", "/runs")[0][3])
+        # Slider mapping: top-level reasoning_effort of a connection model.
+        p, client = make_pipe(sse(DONE))
+        run_pipe(p, model="hermes_runs_pipe.claude-sub/claude-opus-5-5", reasoning_effort="max")
+        self.assertEqual(client.find("POST", "/runs")[0][3]["model_options"], {"reasoning_effort": "max"})
+        p, client = make_pipe(sse(DONE))
+        run_pipe(p, reasoning_effort="low", model_options={"reasoning_effort": "xhigh"})
+        self.assertEqual(client.find("POST", "/runs")[0][3]["model_options"], {"reasoning_effort": "xhigh"})
+        # No options: no model_options key, so config.yaml decides the effort.
+        p, client = make_pipe(sse(DONE))
+        run_pipe(p)
+        self.assertEqual(client.find("POST", "/runs")[0][3], {"input": "Hello", "stream": False, "model": "auto"})
+        p, client = make_pipe(sse(DONE))
+        run_pipe(p, model_options={"service_tier": "priority"})
+        self.assertNotIn("model_options", client.find("POST", "/runs")[0][3])
 
     def test_policy_first_match(self):
         policies = json.dumps([{"match": "^auto", "approval_mode": "auto", "auto_choice": "session"},
