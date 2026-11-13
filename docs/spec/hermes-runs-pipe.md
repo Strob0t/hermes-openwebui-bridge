@@ -181,3 +181,11 @@ Removed: 1-3 (mapping, TTL, file). New:
 - A top-level `reasoning_effort` in the request body (the Open WebUI slider of connection models) fills `model_options.reasoning_effort` if `model_options` has none and the key is in the list.
 - No allowed option: no `model_options` in the run body; Hermes `config.yaml` decides.
 - Tests: `test_run_model_options`, `test_run_body_model_options` (pass-through, allowlist drop, slider mapping, no options), `test_owned_by_comma_list`, `test_short_model_id_dots_and_slashes`.
+
+### 10.8 Images and thinking switch (0.5.0)
+
+- Run input from the last user message. Text only: the same string as in 0.4.0. With images: `[{"role": "user", "content": [{"type": "text", "text": ...}, {"type": "image_url", "image_url": {"url": ...}}]}]`; no text part for an empty text. Hermes v0.23.1 `/v1/runs` takes `input[-1].content` (`gateway/platforms/api_server_runs.py`, `_run_user_message`).
+- Image sources: `image_url` and `input_image` parts of the last user message (Open WebUI v0.12.4 makes them data URLs, `utils/middleware.py`), then image files in `__files__` and `body["files"]` (type `image` or raster `content_type`). URLs: `data:image/...`, `https://`; an Open WebUI file id or `/api/v1/files/<id>/content` goes through the Open WebUI file helper with its access check.
+- Valves `IMAGES_ENABLED` (`True`), `IMAGE_MAX_COUNT` (`4`), `IMAGE_MAX_BYTES` (8 MB decoded). Dropped images give one note per reason from `TEXTS` before the run output. A message with only images starts a run.
+- Thinking switch: `reasoning_effort` `none` or `off` (any case, top level or `model_options`, key in `MODEL_OPTIONS_KEYS`) goes as `model_options.reasoning_effort = "none"`. Hermes maps `none` to `reasoning_config = {"enabled": false}` (`gateway/platforms/api_server_request_options.py`, `_request_reasoning_config`).
+- Tests: `test_image_urls`, `test_image_url_size`, `test_run_input`, `test_thinking_switch`, `test_run_body_text_only`, `test_run_body_text_and_data_image`, `test_images_too_many`, `test_images_too_big_disabled_and_unreadable`, `test_image_files`, `test_run_body_thinking_switch`.

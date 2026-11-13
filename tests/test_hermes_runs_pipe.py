@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import inspect
 import json
 import sys
@@ -45,6 +46,15 @@ MULTI_RESP = {"object": "list", "data": [
     {"id": "claude-sub/claude.x", "owned_by": "bifrost"},
 ]}
 MULTI_FILTER = r"^(auto|claude-sub/claude-[a-z0-9-]+|premiumize/.+)$"
+
+
+def data_image(size, mime="image/png"):
+    """Returns a base64 data URL with size decoded bytes."""
+    return f"data:{mime};base64,{base64.b64encode(bytes(size)).decode()}"
+
+
+IMG_A = data_image(10)
+IMG_B = data_image(20, "image/jpeg")
 
 
 def ev(name, **fields):
@@ -152,8 +162,9 @@ def body_for(text, stream=True, model=MODEL, **fields):
     return {"model": model, "stream": stream, "messages": [{"role": "user", "content": text}], **fields}
 
 
-def run_pipe(p, text="Hello", stream=True, user=None, meta=None, call=None, model=MODEL, **fields):
-    """Runs the pipe to its end. Returns (chunks, emitted events). fields go into the request body."""
+def run_pipe(p, text="Hello", stream=True, user=None, meta=None, call=None, model=MODEL, owui_files=None, **fields):
+    """Runs the pipe to its end. Returns (chunks, emitted events). fields go into the request body,
+    owui_files is the __files__ argument."""
     emitted = []
 
     async def emit(event):
@@ -161,7 +172,8 @@ def run_pipe(p, text="Hello", stream=True, user=None, meta=None, call=None, mode
 
     async def go():
         agen = p.pipe(body_for(text, stream, model, **fields), __user__=dict(user or USER),
-                      __metadata__=dict(meta or META), __event_emitter__=emit, __event_call__=call)
+                      __metadata__=dict(meta or META), __event_emitter__=emit, __event_call__=call,
+                      __files__=owui_files)
         return await _collect(agen)
 
     return asyncio.run(go()), emitted
@@ -313,6 +325,65 @@ class TestHelpers(unittest.TestCase):
         self.assertEqual(pipe_mod.last_user_text([{"role": "assistant", "content": "x"}]), "")
         self.assertEqual(pipe_mod.last_user_text(None), "")
 
+    def test_image_urls(self):
+        # 0.5.0: image parts of the last user message, then image files; unique, in this order.
+        messages = [
+            {"role": "user", "content": [{"type": "image_url", "image_url": {"url": "data:image/png;base64,old"}}]},
+            {"role": "assistant", "content": "ok"},
+            {"role": "user", "content": [
+                {"type": "text", "text": "look"},
+                {"type": "image_url", "image_url": {"url": IMG_A}},
+                {"type": "input_image", "image_url": "https://example.test/b.png"},
+                {"type": "image_url", "image_url": {"url": IMG_A}},
+                {"type": "image_url", "image_url": {}},
+            ]},
+        ]
+        files = [
+            {"type": "image", "url": IMG_B},
+            {"type": "file", "id": "f1", "url": "f1", "content_type": "image/jpeg"},
+            {"type": "file", "id": "f2", "url": "f2", "content_type": "image/svg+xml"},
+            {"type": "file", "id": "f3", "url": "f3", "content_type": "application/pdf"},
+            "not a dict",
+        ]
+        self.assertEqual(pipe_mod.image_urls(messages, files), [IMG_A, "https://example.test/b.png", IMG_B, "f1"])
+        self.assertEqual(pipe_mod.image_urls(messages[:2]), ["data:image/png;base64,old"])
+        self.assertEqual(pipe_mod.image_urls([{"role": "user", "content": "text only"}], None), [])
+        self.assertEqual(pipe_mod.image_urls(None, "x"), [])
+
+    def test_image_url_size(self):
+        self.assertEqual(pipe_mod.image_url_size(data_image(30)), 30)
+        self.assertEqual(pipe_mod.image_url_size(data_image(31)), 31)
+        self.assertEqual(pipe_mod.image_url_size(data_image(32)), 32)
+        self.assertEqual(pipe_mod.image_url_size("DATA:IMAGE/PNG;BASE64,QUJD"), 3)
+        self.assertEqual(pipe_mod.image_url_size("data:image/svg+xml,<svg/>"), 6)
+        self.assertEqual(pipe_mod.image_url_size("https://example.test/a.png"), 0)
+        self.assertIsNone(pipe_mod.image_url_size("http://example.test/a.png"))
+        self.assertIsNone(pipe_mod.image_url_size("data:text/plain;base64,QUJD"))
+        self.assertIsNone(pipe_mod.image_url_size("data:image/png;base64"))
+        self.assertIsNone(pipe_mod.image_url_size("/api/v1/files/f1/content"))
+        self.assertIsNone(pipe_mod.image_url_size(None))
+
+    def test_run_input(self):
+        self.assertEqual(pipe_mod.run_input("Hello", []), "Hello")
+        self.assertEqual(pipe_mod.run_input("Hello", [IMG_A]), [{"role": "user", "content": [
+            {"type": "text", "text": "Hello"}, {"type": "image_url", "image_url": {"url": IMG_A}}]}])
+        self.assertEqual(pipe_mod.run_input("  ", [IMG_A]), [{"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": IMG_A}}]}])
+
+    def test_thinking_switch(self):
+        # 0.5.0: "none" or "off" (any case, top level or model_options) goes as "none"; Hermes turns thinking off.
+        keys = "reasoning_effort"
+        for value in ("none", "off", "OFF", " None "):
+            self.assertEqual(pipe_mod.run_model_options({"reasoning_effort": value}, keys), {"reasoning_effort": "none"})
+            self.assertEqual(pipe_mod.run_model_options({"model_options": {"reasoning_effort": value}}, keys),
+                             {"reasoning_effort": "none"})
+        self.assertEqual(pipe_mod.run_model_options(
+            {"reasoning_effort": "high", "model_options": {"reasoning_effort": "off"}}, keys), {"reasoning_effort": "none"})
+        self.assertEqual(pipe_mod.run_model_options(
+            {"reasoning_effort": "off", "model_options": {"reasoning_effort": "low"}}, keys), {"reasoning_effort": "low"})
+        self.assertEqual(pipe_mod.run_model_options({"reasoning_effort": "offline"}, keys), {"reasoning_effort": "offline"})
+        self.assertEqual(pipe_mod.run_model_options({"reasoning_effort": "off"}, "service_tier"), {})
+
     def test_role_allowed(self):
         self.assertTrue(pipe_mod.role_allowed("admin", "admin"))
         self.assertTrue(pipe_mod.role_allowed("User", "admin, user"))
@@ -434,6 +505,92 @@ class TestDiscovery(unittest.TestCase):
         p, client = make_pipe(sse(DONE))
         run_pipe(p, model_options={"service_tier": "priority"})
         self.assertNotIn("model_options", client.find("POST", "/runs")[0][3])
+
+    def test_run_body_text_only(self):
+        # 0.5.0: text only gives the same string input as 0.4.0, also for a list content without images.
+        p, client = make_pipe(sse(DONE))
+        chunks, _ = run_pipe(p, text=[{"type": "text", "text": "Hello"}])
+        self.assertEqual(client.find("POST", "/runs")[0][3], {"input": "Hello", "stream": False, "model": "auto"})
+        self.assertEqual(text_of(chunks), "done")
+
+    def test_run_body_text_and_data_image(self):
+        p, client = make_pipe(sse(DONE))
+        content = [{"type": "text", "text": "What is this?"}, {"type": "image_url", "image_url": {"url": IMG_A}}]
+        chunks, _ = run_pipe(p, text=content)
+        self.assertEqual(client.find("POST", "/runs")[0][3], {
+            "input": [{"role": "user", "content": [
+                {"type": "text", "text": "What is this?"}, {"type": "image_url", "image_url": {"url": IMG_A}}]}],
+            "stream": False, "model": "auto"})
+        self.assertEqual(text_of(chunks), "done")
+        # Image only: the run starts without a text part.
+        p, client = make_pipe(sse(DONE))
+        run_pipe(p, text=[{"type": "image_url", "image_url": {"url": IMG_A}}])
+        self.assertEqual(client.find("POST", "/runs")[0][3]["input"],
+                         [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": IMG_A}}]}])
+
+    def test_images_too_many(self):
+        p, client = make_pipe(sse(DONE), IMAGE_MAX_COUNT=2)
+        urls = [data_image(n) for n in (1, 2, 3, 4)]
+        content = [{"type": "text", "text": "four"}] + [{"type": "image_url", "image_url": {"url": u}} for u in urls]
+        chunks, _ = run_pipe(p, text=content)
+        parts = client.find("POST", "/runs")[0][3]["input"][0]["content"]
+        self.assertEqual([x["image_url"]["url"] for x in parts[1:]], urls[:2])
+        self.assertEqual(chunks[0], "*(2 image(s) not sent: at most 2 images per message.)*\n\n")
+        self.assertTrue(text_of(chunks).endswith("done"))
+
+    def test_images_too_big_disabled_and_unreadable(self):
+        half_mb = pipe_mod.BYTES_PER_MB // 2
+        p, client = make_pipe(sse(DONE), IMAGE_MAX_BYTES=half_mb)
+        content = [{"type": "text", "text": "x"}, {"type": "image_url", "image_url": {"url": IMG_A}},
+                   {"type": "image_url", "image_url": {"url": data_image(half_mb + 1)}},
+                   {"type": "image_url", "image_url": {"url": "ftp://example.test/a.png"}}]
+        chunks, _ = run_pipe(p, text=content)
+        parts = client.find("POST", "/runs")[0][3]["input"][0]["content"]
+        self.assertEqual([x.get("image_url", {}).get("url") for x in parts], [None, IMG_A])
+        self.assertIn("1 image(s) not sent: larger than 0.5 MB.", chunks[0])
+        self.assertIn("1 image(s) not sent: unsupported or unreadable source.", chunks[1])
+        # IMAGES_ENABLED off: text only as a string, one note.
+        p, client = make_pipe(sse(DONE), IMAGES_ENABLED=False)
+        chunks, _ = run_pipe(p, text=content)
+        self.assertEqual(client.find("POST", "/runs")[0][3]["input"], "x")
+        self.assertEqual(chunks[0], "*(3 image(s) not sent: images are off.)*\n\n")
+        # Only dropped images and no text: no run.
+        p, client = make_pipe(sse(DONE), IMAGES_ENABLED=False)
+        chunks, _ = run_pipe(p, text=[{"type": "image_url", "image_url": {"url": IMG_A}}])
+        self.assertEqual(text_of(chunks), "*(1 image(s) not sent: images are off.)*\n\nNo user message found.")
+        self.assertEqual(client.find("POST", "/runs"), [])
+
+    def test_image_files(self):
+        # Image files in __files__ and body["files"]: a data URL goes as is, a local file URL through the resolver.
+        p, client = make_pipe(sse(DONE))
+        asked = []
+
+        async def resolver(url, user_id):
+            asked.append((url, user_id))
+            return IMG_B if url == "/api/v1/files/f1/content" else None
+
+        p._file_resolver = resolver
+        files = [{"type": "image", "url": IMG_A}, {"type": "file", "url": "/api/v1/files/f1/content",
+                                                   "content_type": "image/png"}]
+        chunks, _ = run_pipe(p, owui_files=files, files=[{"type": "file", "url": "f9", "content_type": "image/gif"}])
+        parts = client.find("POST", "/runs")[0][3]["input"][0]["content"]
+        self.assertEqual(parts, [{"type": "text", "text": "Hello"}, {"type": "image_url", "image_url": {"url": IMG_A}},
+                                 {"type": "image_url", "image_url": {"url": IMG_B}}])
+        self.assertEqual(asked, [("/api/v1/files/f1/content", "u1"), ("f9", "u1")])
+        self.assertIn("1 image(s) not sent: unsupported or unreadable source.", chunks[0])
+        # Outside Open WebUI the default resolver finds no file.
+        self.assertIsNone(asyncio.run(pipe_mod.Pipe._owui_file_image("f1", "u1")))
+
+    def test_run_body_thinking_switch(self):
+        p, client = make_pipe(sse(DONE))
+        run_pipe(p, reasoning_effort="off")
+        self.assertEqual(client.find("POST", "/runs")[0][3]["model_options"], {"reasoning_effort": "none"})
+        p, client = make_pipe(sse(DONE))
+        run_pipe(p, model_options={"reasoning_effort": "Off"})
+        self.assertEqual(client.find("POST", "/runs")[0][3]["model_options"], {"reasoning_effort": "none"})
+        p, client = make_pipe(sse(DONE))
+        run_pipe(p, model_options={"reasoning_effort": "none"})
+        self.assertEqual(client.find("POST", "/runs")[0][3]["model_options"], {"reasoning_effort": "none"})
 
     def test_policy_first_match(self):
         policies = json.dumps([{"match": "^auto", "approval_mode": "auto", "auto_choice": "session"},

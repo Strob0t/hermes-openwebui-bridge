@@ -1,9 +1,9 @@
 """
 title: Hermes Runs Pipe
 author: Strob0t
-version: 0.4.0
+version: 0.5.0
 license: AGPL-3.0
-description: Runs Open WebUI chats as Hermes runs over /v1/runs, with model discovery, tool progress, approval dialogs and one Hermes session per chat.
+description: Runs Open WebUI chats as Hermes runs over /v1/runs, with model discovery, images, tool progress, approval dialogs and one Hermes session per chat.
 required_open_webui_version: 0.12.0
 """
 
@@ -47,6 +47,8 @@ LOG_PREFIX = "hermes runs pipe"
 DEFAULT_MODEL_ID = "hermes-default"
 MODEL_OPTIONS_FIELD = "model_options"
 EFFORT_OPTION = "reasoning_effort"
+EFFORT_OFF_VALUES = ("none", "off")
+EFFORT_NONE = "none"
 POLICY_KEYS = ("approval_mode", "allowed_approval_choices", "auto_choice", "allowed_roles")
 APPROVAL_CHOICES = ("once", "session", "always", "deny")
 APPROVAL_MODES = ("ask", "auto", "deny")
@@ -70,6 +72,22 @@ HEADER_LAST_EVENT_ID = "Last-Event-ID"
 SESSION_KEY_PREFIX = "owui"
 IDEMPOTENCY_KEY_LIMIT = 255
 
+# --- Image input --------------------------------------------------------------------------------
+# Open WebUI v0.12.4 puts the images of a user message into its content as image_url parts with data URLs
+# (utils/middleware.py). Image files in __files__ or body["files"] are a fallback (type "image" or a raster
+# content type, like the middleware). A local file URL is a file id or /api/v1/files/<id>/content.
+IMAGE_PART_TYPES = ("image_url", "input_image")
+IMAGE_FILE_TYPE = "image"
+IMAGE_MIME_PREFIX = "image/"
+SVG_MIME = "image/svg+xml"
+DATA_IMAGE_PREFIX = "data:image/"
+HTTPS_PREFIX = "https://"
+BASE64_MARK = ";base64"
+LOCAL_FILE_URL = re.compile(r"^(?:/api/v1/files/[^/?#]+/content(?:[?#].*)?|[0-9A-Za-z-]+)$")
+BYTES_PER_MB = 1024 * 1024
+DEFAULT_IMAGE_MAX_COUNT = 4
+DEFAULT_IMAGE_MAX_BYTES = 8 * BYTES_PER_MB
+
 # --- Display limits (characters) ----------------------------------------------------------------
 ERROR_TEXT_LIMIT = 300
 STATUS_LINE_LIMIT = 120
@@ -87,6 +105,10 @@ TEXTS = {
     "reset": "Session reset",
     "no_pending": "No open approval in this chat.",
     "no_input": "No user message found.",
+    "images_disabled": "*({count} image(s) not sent: images are off.)*\n\n",
+    "images_too_many": "*({count} image(s) not sent: at most {max_count} images per message.)*\n\n",
+    "images_too_big": "*({count} image(s) not sent: larger than {max_mb} MB.)*\n\n",
+    "images_unreadable": "*({count} image(s) not sent: unsupported or unreadable source.)*\n\n",
     "unreachable": "Hermes is not reachable ({base})",
     "unreachable_detail": "Hermes is not reachable ({base}): {error}",
     "run_rejected": "Hermes rejected the run (HTTP {status}: {detail})",
@@ -236,6 +258,7 @@ def run_model_options(body: Any, keys_csv: Any) -> dict:
     """Returns the model_options for POST /runs: the keys of body.model_options in the allowlist, values as given.
     A top-level reasoning_effort (the Open WebUI slider of connection models) fills model_options.reasoning_effort
     if model_options has none. Keys outside the allowlist are dropped; a top-level None counts as absent.
+    The thinking switch: a reasoning_effort "none" or "off" (any case) goes as "none", which turns thinking off.
     """
     if not isinstance(body, dict):
         return {}
@@ -244,6 +267,9 @@ def run_model_options(body: Any, keys_csv: Any) -> dict:
     options = {k: v for k, v in raw.items() if k in allowed} if isinstance(raw, dict) else {}
     if EFFORT_OPTION in allowed and EFFORT_OPTION not in options and body.get(EFFORT_OPTION) is not None:
         options[EFFORT_OPTION] = body[EFFORT_OPTION]
+    effort = options.get(EFFORT_OPTION)
+    if isinstance(effort, str) and effort.strip().lower() in EFFORT_OFF_VALUES:
+        options[EFFORT_OPTION] = EFFORT_NONE
     return options
 
 
@@ -323,19 +349,81 @@ async def parse_sse(byte_iter: Any) -> AsyncIterator[tuple[Optional[str], dict]]
                     data.append(value)
 
 
-def last_user_text(messages: Any) -> str:
-    """Returns the text of the last user message (string content or the text parts of a list)."""
+def _last_user_content(messages: Any) -> Any:
+    """Returns the content of the last user message, else None."""
     if not isinstance(messages, list):
-        return ""
+        return None
     for item in reversed(messages):
         if isinstance(item, dict) and item.get("role") == "user":
-            content = item.get("content")
-            if isinstance(content, str):
-                return content
-            if isinstance(content, list):
-                return "\n".join(p.get("text", "") for p in content if isinstance(p, dict) and isinstance(p.get("text"), str))
-            return ""
+            return item.get("content")
+    return None
+
+
+def last_user_text(messages: Any) -> str:
+    """Returns the text of the last user message (string content or the text parts of a list)."""
+    content = _last_user_content(messages)
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "\n".join(p.get("text", "") for p in content if isinstance(p, dict) and isinstance(p.get("text"), str))
     return ""
+
+
+def _part_url(part: dict) -> Any:
+    """Returns the URL of an image part: image_url as {"url": ...} (Chat Completions) or as a string."""
+    ref = part.get("image_url")
+    return ref.get("url") if isinstance(ref, dict) else ref
+
+
+def _is_image_file(item: dict) -> bool:
+    """Returns True for a file of type "image" or with a raster image content type (not SVG)."""
+    mime = str(item.get("content_type") or "").split(";")[0].strip().lower()
+    return item.get("type") == IMAGE_FILE_TYPE or (mime.startswith(IMAGE_MIME_PREFIX) and mime != SVG_MIME)
+
+
+def image_urls(messages: Any, files: Any = None) -> list[str]:
+    """Returns the unique image URLs of the last user message (image_url and input_image parts), then of the
+    image files, in this order. Empty and non-string URLs are dropped.
+    """
+    content = _last_user_content(messages)
+    parts = content if isinstance(content, list) else []
+    urls = [_part_url(p) for p in parts if isinstance(p, dict) and p.get("type") in IMAGE_PART_TYPES]
+    urls += [f.get("url") for f in (files if isinstance(files, list) else []) if isinstance(f, dict) and _is_image_file(f)]
+    out: list[str] = []
+    for url in urls:
+        if isinstance(url, str) and url and url not in out:
+            out.append(url)
+    return out
+
+
+def image_url_size(url: Any) -> Optional[int]:
+    """Returns the decoded byte size of a data:image URL, 0 for an https URL (size not known) and None for
+    every other source. Only the prefix is lower-cased, so a large data URL is not copied.
+    """
+    if not isinstance(url, str):
+        return None
+    head = url[:len(DATA_IMAGE_PREFIX)].lower()
+    if head.startswith(HTTPS_PREFIX):
+        return 0
+    comma = url.find(",")
+    if not head.startswith(DATA_IMAGE_PREFIX) or comma < 0:
+        return None
+    size = len(url) - comma - 1
+    if not url[:comma].lower().endswith(BASE64_MARK):
+        return size
+    padding = 2 if url.endswith("==") else 1 if url.endswith("=") else 0
+    return (size - padding) * 3 // 4
+
+
+def run_input(text: str, urls: list[str]) -> Any:
+    """Returns the POST /runs input: the text as given without images, else one user message with a text part
+    (only for a non-empty text) and one image_url part per URL.
+    """
+    if not urls:
+        return text
+    parts: list[dict] = [{"type": "text", "text": text}] if text.strip() else []
+    parts += [{"type": "image_url", "image_url": {"url": url}} for url in urls]
+    return [{"role": "user", "content": parts}]
 
 
 def role_allowed(role: Any, allowed_csv: Any) -> bool:
@@ -444,11 +532,12 @@ class _Ctx:
         self.auto_choice = str(policy.get("auto_choice") or v.AUTO_CHOICE)
         self.allowed_roles = policy.get("allowed_roles") or v.ALLOWED_ROLES
 
-    def run_body(self, text: str) -> dict:
+    def run_body(self, user_input: Any) -> dict:
         """Returns the POST /runs body; model and provider only for a discovered model, not for the default entry.
+        user_input is the text, or a list with one user message for images (see run_input).
         model_options (MODEL_OPTIONS_KEYS allowlist) only if the request has at least one allowed option.
         """
-        body: dict = {"input": text, "stream": False}
+        body: dict = {"input": user_input, "stream": False}
         if self.run_model:
             body["model"] = self.run_model
             if self.run_provider:
@@ -515,7 +604,19 @@ class Pipe:
         )
         MODEL_OPTIONS_KEYS: str = Field(
             default=EFFORT_OPTION,
-            description="Comma-separated keys of body.model_options that go to POST /runs (a top-level reasoning_effort fills reasoning_effort); other keys are dropped; empty = none",
+            description="Comma-separated keys of body.model_options that go to POST /runs (a top-level reasoning_effort fills reasoning_effort; none or off turns thinking off); other keys are dropped; empty = none",
+        )
+        IMAGES_ENABLED: bool = Field(
+            default=True,
+            description="Send the images of the last user message to Hermes; off = drop them with a note",
+        )
+        IMAGE_MAX_COUNT: int = Field(
+            default=DEFAULT_IMAGE_MAX_COUNT,
+            description="Maximum images per message; more are dropped with a note",
+        )
+        IMAGE_MAX_BYTES: int = Field(
+            default=DEFAULT_IMAGE_MAX_BYTES,
+            description="Maximum decoded bytes per image (data URL); a larger image is dropped with a note",
         )
         ROUTE_HEADER: str = Field(
             default="X-Hermes-Route",
@@ -566,6 +667,7 @@ class Pipe:
         self.type = "manifold"
         self.valves = self.Valves()
         self._client_factory: Callable[[], Any] = self._default_client
+        self._file_resolver: Callable[[str, str], Awaitable[Optional[str]]] = self._owui_file_image
         self._now: Callable[[], float] = time.monotonic
         self._resets: dict[tuple, int] = {}
         self._pending: dict[tuple, dict] = {}
@@ -578,6 +680,24 @@ class Pipe:
         if aiohttp is None:
             raise RuntimeError("aiohttp is not installed")
         return aiohttp.ClientSession()
+
+    @staticmethod
+    async def _owui_file_image(url: str, user_id: str) -> Optional[str]:
+        """Returns the data URL of an Open WebUI file (file id or /api/v1/files/<id>/content) with the access check
+        of Open WebUI v0.12.4 (utils/files.py, get_image_base64_from_url). None outside Open WebUI, for an unknown
+        user or file, or without access.
+        """
+        try:
+            from open_webui.models.users import Users
+            from open_webui.utils.files import get_image_base64_from_url
+        except ImportError:
+            return None
+        try:
+            user = await Users.get_user_by_id(user_id) if user_id else None
+            return await get_image_base64_from_url(url, user=user) if user else None
+        except Exception as e:
+            log.warning("%s: image file %s not readable: %s", LOG_PREFIX, url[:INVALID_INPUT_PREVIEW], e)
+            return None
 
     def policies(self) -> list[dict]:
         return parse_policies(self.valves.MODEL_POLICIES)
@@ -724,6 +844,7 @@ class Pipe:
         __metadata__: Optional[dict] = None,
         __event_emitter__: Optional[Callable[[dict], Awaitable[None]]] = None,
         __event_call__: Optional[Callable[[dict], Awaitable[Any]]] = None,
+        __files__: Optional[list] = None,
     ) -> AsyncIterator[Any]:
         try:
             body = body if isinstance(body, dict) else {}
@@ -745,14 +866,21 @@ class Pipe:
             if slash and ctx.key not in self._pending:
                 yield self._t("no_pending")
                 return
-            if not slash and not text.strip():
+            urls: list[str] = []
+            if not slash:
+                files = (__files__ if isinstance(__files__, list) else []) + (
+                    body["files"] if isinstance(body.get("files"), list) else [])
+                urls, notes = await self._images(ctx, image_urls(body.get("messages"), files))
+                for note in notes:
+                    yield note
+            if not slash and not text.strip() and not urls:
                 yield self._t("no_input")
                 return
             async with self._client_factory() as client:
                 if slash:
                     chunks = self._answer_pending(client, ctx, slash, __event_emitter__, __event_call__)
                 else:
-                    chunks = self._start(client, ctx, text, __event_emitter__, __event_call__)
+                    chunks = self._start(client, ctx, run_input(text, urls), __event_emitter__, __event_call__)
                 async with aclosing(chunks):
                     async for chunk in chunks:
                         if ctx.stream and isinstance(chunk, str) and chunk.startswith("data:"):
@@ -765,11 +893,43 @@ class Pipe:
             log.exception("%s failed", LOG_PREFIX)
             yield self._t("pipe_error", error=f"{type(e).__name__}: {e}")
 
-    async def _start(self, client: Any, ctx: _Ctx, text: str, emit, call) -> AsyncIterator[Any]:
-        """Starts a run with the last user message and follows it."""
+    async def _images(self, ctx: _Ctx, urls: list[str]) -> tuple[list[str], list[str]]:
+        """Applies IMAGES_ENABLED, IMAGE_MAX_COUNT and IMAGE_MAX_BYTES to the image URLs.
+        A local file URL becomes a data URL through _file_resolver. Returns (URLs for the run, notes about the
+        dropped images, one per reason).
+        """
+        if not urls:
+            return [], []
+        if not self.valves.IMAGES_ENABLED:
+            return [], [self._t("images_disabled", count=len(urls))]
+        max_count = max(0, int(self.valves.IMAGE_MAX_COUNT))
+        max_bytes = int(self.valves.IMAGE_MAX_BYTES)
+        kept: list[str] = []
+        dropped = {"images_too_many": 0, "images_too_big": 0, "images_unreadable": 0}
+        for url in urls:
+            if len(kept) >= max_count:
+                dropped["images_too_many"] += 1
+                continue
+            if LOCAL_FILE_URL.match(url):
+                url = await self._file_resolver(url, ctx.user_id) or ""
+            size = image_url_size(url)
+            if size is None:
+                dropped["images_unreadable"] += 1
+            elif size > max_bytes:
+                dropped["images_too_big"] += 1
+            elif url not in kept:
+                kept.append(url)
+        max_mb = f"{round(max_bytes / BYTES_PER_MB, 1):g}"
+        notes = [self._t(key, count=count, max_count=max_count, max_mb=max_mb) for key, count in dropped.items() if count]
+        if notes:
+            log.info("%s: %s of %s image(s) dropped", LOG_PREFIX, sum(dropped.values()), len(urls))
+        return kept, notes
+
+    async def _start(self, client: Any, ctx: _Ctx, user_input: Any, emit, call) -> AsyncIterator[Any]:
+        """Starts a run with the last user message (text, or text and images) and follows it."""
         try:
             status, data, headers = await self._request(
-                client, "post", ctx, "/runs", ctx.run_body(text),
+                client, "post", ctx, "/runs", ctx.run_body(user_input),
                 **{HEADER_IDEMPOTENCY: idempotency_key(ctx.chat_id, ctx.message_id)})
         except NETWORK_ERRORS as e:
             log.warning("%s: POST /runs failed: %s", LOG_PREFIX, e)
