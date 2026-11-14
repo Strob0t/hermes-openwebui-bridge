@@ -1,7 +1,7 @@
 """
 title: Hermes Runs Pipe
 author: Strob0t
-version: 0.5.0
+version: 0.5.1
 license: AGPL-3.0
 description: Runs Open WebUI chats as Hermes runs over /v1/runs, with model discovery, images, tool progress, approval dialogs and one Hermes session per chat.
 required_open_webui_version: 0.12.0
@@ -10,6 +10,7 @@ required_open_webui_version: 0.12.0
 import asyncio
 import json
 import logging
+import math
 import re
 import string
 import time
@@ -88,6 +89,14 @@ BYTES_PER_MB = 1024 * 1024
 DEFAULT_IMAGE_MAX_COUNT = 4
 DEFAULT_IMAGE_MAX_BYTES = 8 * BYTES_PER_MB
 
+# --- Tool durations -----------------------------------------------------------------------------
+# Hermes v0.23.1 sends tool.completed with duration 0 for /v1/runs (gateway/platforms/api_server_runs.py,
+# _tool_complete gives no duration). Every run event has a "timestamp" (time.time()), and tool.started and
+# tool.completed have the same tool_call_id, so the pipe measures the time between them.
+TOOL_STARTS_LIMIT = 64
+DURATION_DECIMAL_LIMIT = 10
+SECONDS_PER_MINUTE = 60
+
 # --- Display limits (characters) ----------------------------------------------------------------
 ERROR_TEXT_LIMIT = 300
 STATUS_LINE_LIMIT = 120
@@ -138,7 +147,11 @@ TEXTS = {
     "no_error_text": "no error text",
     "unknown": "unknown",
     "tool_started": "{tool}: {preview}",
-    "tool_done": "{tool} done ({duration} s{error})",
+    "tool_done": "{tool} done ({duration}{error})",
+    "tool_done_no_duration": "{tool} done{error}",
+    "duration_decimal": "{seconds:.1f} s",
+    "duration_seconds": "{seconds} s",
+    "duration_minutes": "{minutes} min {seconds} s",
     "tool_error_suffix": ", error",
     "tool_fallback_name": "tool",
     "subagent_start": "Subagent started",
@@ -470,6 +483,27 @@ def _error_text(data: Any, limit: int = ERROR_TEXT_LIMIT) -> str:
     return re.sub(r"\s+", " ", str(data or "")).strip()[:limit]
 
 
+def _number(value: Any) -> Optional[float]:
+    """Returns a finite int or float (not bool) as float, else None."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+        return None
+    return float(value)
+
+
+def duration_parts(seconds: float) -> tuple[str, dict]:
+    """Returns the TEXTS key and the values for a tool duration: below DURATION_DECIMAL_LIMIT seconds with
+    1 decimal, below one minute in whole seconds, else minutes and seconds.
+    """
+    seconds = max(0.0, seconds)
+    if round(seconds, 1) < DURATION_DECIMAL_LIMIT:
+        return "duration_decimal", {"seconds": seconds}
+    whole = round(seconds)
+    if whole < SECONDS_PER_MINUTE:
+        return "duration_seconds", {"seconds": whole}
+    minutes, rest = divmod(whole, SECONDS_PER_MINUTE)
+    return "duration_minutes", {"minutes": minutes, "seconds": rest}
+
+
 def _or_list(items: list[str], or_word: str = TEXTS["or"]) -> str:
     """Returns "a, b or c" (or_word carries the spaces)."""
     return items[0] if len(items) == 1 else ", ".join(items[:-1]) + or_word + items[-1]
@@ -570,6 +604,8 @@ class _Run:
         self.sent_choice = ""
         self.done = False
         self.parked = False
+        # tool_call_id -> (event timestamp or None, receipt time of self._now()), at most TOOL_STARTS_LIMIT
+        self.tool_starts: dict[str, tuple[Optional[float], float]] = {}
 
 
 class Pipe:
@@ -1074,6 +1110,7 @@ class Pipe:
                 run.streamed += text
                 yield text
         elif name == "tool.started" and show:
+            self._tool_started(run, data)
             tool = data.get("tool") or self._t("tool_fallback_name")
             line = self._t("tool_started", tool=tool, preview=data.get("preview") or "").rstrip(": ")
             await self._status(emit, line[:STATUS_LINE_LIMIT])
@@ -1083,7 +1120,12 @@ class Pipe:
         elif name == "tool.completed" and show:
             tool = data.get("tool") or self._t("tool_fallback_name")
             error = self._t("tool_error_suffix") if data.get("error") else ""
-            line = self._t("tool_done", tool=tool, duration=data.get("duration") or 0, error=error)
+            seconds = self._tool_duration(run, data)
+            if seconds is None:
+                line = self._t("tool_done_no_duration", tool=tool, error=error)
+            else:
+                key, values = duration_parts(seconds)
+                line = self._t("tool_done", tool=tool, duration=self._t(key, **values), error=error)
             await self._status(emit, line[:STATUS_LINE_LIMIT])
             chunk = self._reasoning(ctx, f"> {line}\n")
             if chunk:
@@ -1126,6 +1168,35 @@ class Pipe:
             yield self._t("run_end_with_error", label=label, error=error) if error else self._t("run_end_plain", label=label)
         elif self.valves.DEBUG:
             log.debug("%s: event %s ignored", LOG_PREFIX, name)
+
+    def _tool_started(self, run: _Run, data: dict) -> None:
+        """Stores the start of a tool call by tool_call_id: the event timestamp and the receipt time.
+        Keeps at most TOOL_STARTS_LIMIT starts; the oldest goes first.
+        """
+        call_id = data.get("tool_call_id")
+        if not isinstance(call_id, str) or not call_id:
+            return
+        run.tool_starts.pop(call_id, None)
+        while len(run.tool_starts) >= TOOL_STARTS_LIMIT:
+            run.tool_starts.pop(next(iter(run.tool_starts)))
+        run.tool_starts[call_id] = (_number(data.get("timestamp")), self._now())
+
+    def _tool_duration(self, run: _Run, data: dict) -> Optional[float]:
+        """Returns the seconds of a completed tool call: the event duration if it is > 0, else the completed
+        timestamp minus the start timestamp, else the difference of the receipt times. None without a start.
+        """
+        call_id = data.get("tool_call_id")
+        start = run.tool_starts.pop(call_id, None) if isinstance(call_id, str) and call_id else None
+        duration = _number(data.get("duration"))
+        if duration is not None and duration > 0:
+            return duration
+        if start is None:
+            return None
+        started_at, received_at = start
+        completed_at = _number(data.get("timestamp"))
+        if started_at is not None and completed_at is not None:
+            return max(0.0, completed_at - started_at)
+        return max(0.0, self._now() - received_at)
 
     def _approve_hint(self, offered: list[str]) -> str:
         approve = [c for c in offered if c != CHOICE_DENY]

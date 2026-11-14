@@ -14,7 +14,7 @@ Detailed analyses and decisions can be found in the [`docs/`](docs/README.md) fo
 |---|---|---|---|
 | `skills/openwebui-visuals` | Hermes Skill | **in progress** | Format instructions for Hermes (Mermaid, SVG, HTML-Artifacts, `MEDIA:`-fallback) |
 | `functions/hermes_embeds_filter.py` | Open WebUI Filter | **0.2.0, installed in stack `ki`** | Converts ```viz-html blocks to native Open-WebUI `embeds` (iframe with Chart.js / dashboards) |
-| `functions/hermes_runs_pipe.py` | Open WebUI Pipe (Manifold) | **0.5.0, model discovery, images (`IMAGES_ENABLED`, `IMAGE_MAX_COUNT`, `IMAGE_MAX_BYTES`), thinking switch, `model_options` pass-through (`MODEL_OPTIONS_KEYS`), multi-model setup** | Integration of `/v1/runs`, approvals, and session headers (ADR [0002](docs/decisions/0002-runs-pipe.md), specification [`docs/spec/hermes-runs-pipe.md`](docs/spec/hermes-runs-pipe.md)) |
+| `functions/hermes_runs_pipe.py` | Open WebUI Pipe (Manifold) | **0.5.1, model discovery, images (`IMAGES_ENABLED`, `IMAGE_MAX_COUNT`, `IMAGE_MAX_BYTES`), thinking switch, `model_options` pass-through (`MODEL_OPTIONS_KEYS`), multi-model setup, tool durations from event timestamps** | Integration of `/v1/runs`, approvals, and session headers (ADR [0002](docs/decisions/0002-runs-pipe.md), specification [`docs/spec/hermes-runs-pipe.md`](docs/spec/hermes-runs-pipe.md)) |
 | `router/` / Router integration | AIOHTTP Relay | **monitored** | Buffering of SSE frames, reasoning conversion, planned MEDIA inlining |
 
 ## Installation & Notes

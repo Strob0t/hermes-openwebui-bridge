@@ -43,7 +43,7 @@ Open WebUI pipe that runs a chat as a Hermes run via `/v1/runs`, streams tool pr
 | `message.delta` | `delta` | stream as `content` chunk (R l.1072) |
 | `message.interim` | `text`, `already_streamed` | only emit if `already_streamed` false (R l.1081) |
 | `tool.started` | `tool`, `preview`, `tool_call_id` | `reasoning_content`: `> tool: preview` (R l.141) |
-| `tool.completed` | `tool`, `duration`, `error`, `preview` | `reasoning_content`: duration and error flag (R l.142) |
+| `tool.completed` | `tool`, `duration`, `error`, `preview` | `reasoning_content`: duration and error flag (R l.142); duration 0 is measured from `tool.started` (10.9) |
 | `reasoning.available` | `text` | `reasoning_content` (R l.145) |
 | `subagent.start`, `subagent.complete` | `preview` | Status event |
 | `approval.request` | `command`, `description`, `choices`, `request_id` | Section 5 (A l.90-102) |
@@ -189,3 +189,10 @@ Removed: 1-3 (mapping, TTL, file). New:
 - Valves `IMAGES_ENABLED` (`True`), `IMAGE_MAX_COUNT` (`4`), `IMAGE_MAX_BYTES` (8 MB decoded). Dropped images give one note per reason from `TEXTS` before the run output. A message with only images starts a run.
 - Thinking switch: `reasoning_effort` `none` or `off` (any case, top level or `model_options`, key in `MODEL_OPTIONS_KEYS`) goes as `model_options.reasoning_effort = "none"`. Hermes maps `none` to `reasoning_config = {"enabled": false}` (`gateway/platforms/api_server_request_options.py`, `_request_reasoning_config`).
 - Tests: `test_image_urls`, `test_image_url_size`, `test_run_input`, `test_thinking_switch`, `test_run_body_text_only`, `test_run_body_text_and_data_image`, `test_images_too_many`, `test_images_too_big_disabled_and_unreadable`, `test_image_files`, `test_run_body_thinking_switch`.
+
+### 10.9 Tool durations (0.5.1)
+
+- Hermes v0.23.1 `/v1/runs`: `tool.completed` has `duration` 0, because `_tool_complete` of `observe_api_turn` calls `tool_cb` without `duration` (`gateway/platforms/api_server_runs.py`, `_FIXED_EVENT_FIELDS`). `_run_event` adds `timestamp` (`time.time()`) to every event; `tool.started` and `tool.completed` carry the same `tool_call_id`.
+- The pipe stores (event `timestamp`, receipt time) per `tool_call_id` on `tool.started` and pops it on `tool.completed`. Duration: event `duration` if > 0, else completed `timestamp` minus started `timestamp`, else the receipt time difference. No start: `tool_done_no_duration` (`<tool> done`). At most `TOOL_STARTS_LIMIT` (64) starts per run; the oldest goes first.
+- Format: below 10 s with 1 decimal, below 60 s whole seconds, else `<m> min <s> s` (`TEXTS` keys `duration_decimal`, `duration_seconds`, `duration_minutes`). `{duration}` in `tool_done` holds the unit.
+- Tests: `test_tool_duration_from_timestamps`, `test_tool_duration_event_wins`, `test_tool_duration_receipt_time_fallback`, `test_tool_duration_missing_start`, `test_tool_duration_formats`, `test_tool_duration_parallel_calls`, `test_tool_starts_bounded`.
