@@ -676,32 +676,24 @@ class TestPipe(unittest.TestCase):
         self.assertEqual([e["data"]["description"] for e in emitted if " done" in e["data"]["description"]], lines)
         return lines
 
-    def test_tool_duration_from_timestamps(self):
-        # 0.5.1: Hermes sends duration 0; the pipe takes completed timestamp minus started timestamp.
+    def test_tool_duration_native(self):
+        # 0.5.2: Hermes v0.23.1-2 (vendored upstream PR #149737) sends the native duration on tool.completed.
         lines = self.tool_lines(
-            ev("tool.started", tool="terminal", preview="sleep 3", tool_call_id="t1", timestamp=1000.0),
-            ev("tool.completed", tool="terminal", duration=0, error=False, tool_call_id="t1", timestamp=1003.04))
-        self.assertEqual(lines, ["terminal done (3.0 s)"])
+            ev("tool.started", tool="terminal", preview="sleep 3", tool_call_id="t1"),
+            ev("tool.completed", tool="terminal", duration=3.329, error=False, tool_call_id="t1"))
+        self.assertEqual(lines, ["terminal done (3.3 s)"])
 
-    def test_tool_duration_event_wins(self):
+    def test_tool_duration_error_suffix(self):
         lines = self.tool_lines(
-            ev("tool.started", tool="terminal", tool_call_id="t1", timestamp=1000.0),
-            ev("tool.completed", tool="terminal", duration=1.5, error=True, tool_call_id="t1", timestamp=1009.0))
+            ev("tool.started", tool="terminal", tool_call_id="t1"),
+            ev("tool.completed", tool="terminal", duration=1.5, error=True, tool_call_id="t1"))
         self.assertEqual(lines, ["terminal done (1.5 s, error)"])
 
-    def test_tool_duration_receipt_time_fallback(self):
-        # Without event timestamps the receipt times of self._now() count.
-        p, _ = make_pipe(sse(ev("tool.started", tool="terminal", tool_call_id="t1"),
-                             ev("tool.completed", tool="terminal", duration=0, tool_call_id="t1"), DONE))
-        clock = iter([100.0, 104.25])
-        p._now = lambda: next(clock)
-        chunks, _ = run_pipe(p)
-        self.assertIn("terminal done (4.2 s)", reasoning_of(chunks))
-
-    def test_tool_duration_missing_start(self):
+    def test_tool_duration_zero_or_missing_shows_no_time(self):
+        # A missing or non-positive duration shows no time; the measurement fallback is gone in 0.5.2.
         lines = self.tool_lines(
-            ev("tool.completed", tool="terminal", duration=0, tool_call_id="t9", timestamp=1003.0),
-            ev("tool.completed", tool="read_file", duration=0, error=True, timestamp=1004.0))
+            ev("tool.completed", tool="terminal", duration=0, tool_call_id="t9"),
+            ev("tool.completed", tool="read_file", error=True))
         self.assertEqual(lines, ["terminal done", "read_file done, error"])
 
     def test_tool_duration_formats(self):
@@ -711,36 +703,17 @@ class TestPipe(unittest.TestCase):
         self.assertEqual(pipe_mod.duration_parts(59.6), ("duration_minutes", {"minutes": 1, "seconds": 0}))
         self.assertEqual(pipe_mod.duration_parts(-1), ("duration_decimal", {"seconds": 0.0}))
         lines = self.tool_lines(
-            ev("tool.started", tool="a", tool_call_id="t1", timestamp=1000.0),
-            ev("tool.completed", tool="a", duration=0, tool_call_id="t1", timestamp=1000.04),
-            ev("tool.started", tool="b", tool_call_id="t2", timestamp=1000.0),
-            ev("tool.completed", tool="b", duration=0, tool_call_id="t2", timestamp=1042.4),
-            ev("tool.started", tool="c", tool_call_id="t3", timestamp=1000.0),
-            ev("tool.completed", tool="c", duration=0, tool_call_id="t3", timestamp=1125.0))
+            ev("tool.completed", tool="a", duration=0.04, tool_call_id="t1"),
+            ev("tool.completed", tool="b", duration=42.4, tool_call_id="t2"),
+            ev("tool.completed", tool="c", duration=125.0, tool_call_id="t3"))
         self.assertEqual(lines, ["a done (0.0 s)", "b done (42 s)", "c done (2 min 5 s)"])
 
-    def test_tool_duration_parallel_calls(self):
+    def test_tool_duration_ignores_measurement(self):
+        # Two completed events for one tool_call_id each use their own native duration; no stored start state.
         lines = self.tool_lines(
-            ev("tool.started", tool="terminal", tool_call_id="t1", timestamp=1000.0),
-            ev("tool.started", tool="terminal", tool_call_id="t2", timestamp=1001.0),
-            ev("tool.completed", tool="terminal", duration=0, tool_call_id="t2", timestamp=1001.5),
-            ev("tool.completed", tool="terminal", duration=0, tool_call_id="t1", timestamp=1003.0),
-            ev("tool.completed", tool="terminal", duration=0, tool_call_id="t1", timestamp=1004.0))
-        # The second completed of t1 has no start any more: the entry is popped.
-        self.assertEqual(lines, ["terminal done (0.5 s)", "terminal done (3.0 s)", "terminal done"])
-
-    def test_tool_starts_bounded(self):
-        p, _ = make_pipe()
-        run = pipe_mod._Run("r1")
-        for i in range(pipe_mod.TOOL_STARTS_LIMIT + 5):
-            p._tool_started(run, {"tool_call_id": f"t{i}", "timestamp": 1000.0 + i})
-        self.assertEqual(len(run.tool_starts), pipe_mod.TOOL_STARTS_LIMIT)
-        self.assertNotIn("t0", run.tool_starts)
-        self.assertIsNone(p._tool_duration(run, {"tool_call_id": "t0", "duration": 0, "timestamp": 2000.0}))
-        last = f"t{pipe_mod.TOOL_STARTS_LIMIT + 4}"
-        self.assertEqual(p._tool_duration(run, {"tool_call_id": last, "duration": 0,
-                                                "timestamp": 1000.0 + pipe_mod.TOOL_STARTS_LIMIT + 6}), 2.0)
-        self.assertEqual(len(run.tool_starts), pipe_mod.TOOL_STARTS_LIMIT - 1)
+            ev("tool.completed", tool="terminal", duration=0.5, tool_call_id="t1"),
+            ev("tool.completed", tool="terminal", duration=3.0, tool_call_id="t1"))
+        self.assertEqual(lines, ["terminal done (0.5 s)", "terminal done (3.0 s)"])
 
     def test_run_completed_remaining_output(self):
         # Spec test 6.
