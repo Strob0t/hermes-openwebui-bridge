@@ -1,7 +1,7 @@
 """
 title: Hermes Runs Pipe
 author: Strob0t
-version: 0.5.1
+version: 0.5.2
 license: AGPL-3.0
 description: Runs Open WebUI chats as Hermes runs over /v1/runs, with model discovery, images, tool progress, approval dialogs and one Hermes session per chat.
 required_open_webui_version: 0.12.0
@@ -90,10 +90,8 @@ DEFAULT_IMAGE_MAX_COUNT = 4
 DEFAULT_IMAGE_MAX_BYTES = 8 * BYTES_PER_MB
 
 # --- Tool durations -----------------------------------------------------------------------------
-# Hermes v0.23.1 sends tool.completed with duration 0 for /v1/runs (gateway/platforms/api_server_runs.py,
-# _tool_complete gives no duration). Every run event has a "timestamp" (time.time()), and tool.started and
-# tool.completed have the same tool_call_id, so the pipe measures the time between them.
-TOOL_STARTS_LIMIT = 64
+# Hermes v0.23.1-2 (vendored upstream PR #149737) sends tool.completed with the native "duration" in seconds,
+# so the pipe shows that value. A missing or non-positive duration shows no time.
 DURATION_DECIMAL_LIMIT = 10
 SECONDS_PER_MINUTE = 60
 
@@ -604,8 +602,6 @@ class _Run:
         self.sent_choice = ""
         self.done = False
         self.parked = False
-        # tool_call_id -> (event timestamp or None, receipt time of self._now()), at most TOOL_STARTS_LIMIT
-        self.tool_starts: dict[str, tuple[Optional[float], float]] = {}
 
 
 class Pipe:
@@ -1110,7 +1106,6 @@ class Pipe:
                 run.streamed += text
                 yield text
         elif name == "tool.started" and show:
-            self._tool_started(run, data)
             tool = data.get("tool") or self._t("tool_fallback_name")
             line = self._t("tool_started", tool=tool, preview=data.get("preview") or "").rstrip(": ")
             await self._status(emit, line[:STATUS_LINE_LIMIT])
@@ -1169,34 +1164,14 @@ class Pipe:
         elif self.valves.DEBUG:
             log.debug("%s: event %s ignored", LOG_PREFIX, name)
 
-    def _tool_started(self, run: _Run, data: dict) -> None:
-        """Stores the start of a tool call by tool_call_id: the event timestamp and the receipt time.
-        Keeps at most TOOL_STARTS_LIMIT starts; the oldest goes first.
-        """
-        call_id = data.get("tool_call_id")
-        if not isinstance(call_id, str) or not call_id:
-            return
-        run.tool_starts.pop(call_id, None)
-        while len(run.tool_starts) >= TOOL_STARTS_LIMIT:
-            run.tool_starts.pop(next(iter(run.tool_starts)))
-        run.tool_starts[call_id] = (_number(data.get("timestamp")), self._now())
-
     def _tool_duration(self, run: _Run, data: dict) -> Optional[float]:
-        """Returns the seconds of a completed tool call: the event duration if it is > 0, else the completed
-        timestamp minus the start timestamp, else the difference of the receipt times. None without a start.
+        """Returns the seconds of a completed tool call: the native event duration if it is > 0, else None.
+        Hermes v0.23.1-2 (vendored upstream PR #149737) sends the duration on tool.completed.
         """
-        call_id = data.get("tool_call_id")
-        start = run.tool_starts.pop(call_id, None) if isinstance(call_id, str) and call_id else None
         duration = _number(data.get("duration"))
         if duration is not None and duration > 0:
             return duration
-        if start is None:
-            return None
-        started_at, received_at = start
-        completed_at = _number(data.get("timestamp"))
-        if started_at is not None and completed_at is not None:
-            return max(0.0, completed_at - started_at)
-        return max(0.0, self._now() - received_at)
+        return None
 
     def _approve_hint(self, offered: list[str]) -> str:
         approve = [c for c in offered if c != CHOICE_DENY]
